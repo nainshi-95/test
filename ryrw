@@ -1,0 +1,694 @@
+import os
+import argparse
+import yaml
+import importlib
+import logging
+import time
+import glob
+import random
+import math
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+
+Tensor = torch.Tensor
+
+
+# config
+# Train/Val 경로 분리
+train_dataset_path = "A:/python_code/DB/DIV2k_train"
+val_dataset_path = "A:/python_code/DB/Kodak"
+batch_size = 2
+num_workers = 2
+
+# Training Settings
+epochs = 100
+base_lr = 0.0001
+print_freq = 10
+
+# Custom LR Scheduler
+lr_milestones = [40, 50, 55]
+lr_multipliers = [0.5, 0.1, 0.01]
+
+
+
+
+
+# Rich 라이브러리
+from rich.progress import (
+    Progress,
+    TextColumn,
+    BarColumn,
+    TaskProgressColumn,
+    TimeRemainingColumn,
+    MofNCompleteColumn
+)
+from rich.console import Console
+
+
+
+# -----------------------------------------------------------------------------
+# Utils: AverageMeter & Logger
+# -----------------------------------------------------------------------------
+class MovingAverageMeter:
+    def __init__(self, momentum=0.95):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = {}
+        self.avg = {}
+
+    def update(self, val_dict):
+        # n은 이동평균에서 보통 무시되므로 인자에서 제거하거나 사용하지 않습니다.
+        for key, value in val_dict.items():
+            self.val[key] = value
+
+            if key not in self.avg:
+                # 처음 들어온 값은 그대로 초기값으로 사용
+                self.avg[key] = value
+            else:
+                # 기존 값 * 0.95 + 새 값 * 0.05
+                self.avg[key] = self.avg[key] * self.momentum + value * (1 - self.momentum)
+
+    def get_str(self):
+        return " | ".join([f"{k}: {v:.6f}" for k, v in self.avg.items()])
+
+
+
+
+class AccumulateMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.sum = {}
+        self.count = {}
+
+    def update(self, val_dict, n=1):
+        for key, value in val_dict.items():
+            if key not in self.sum:
+                self.sum[key] = 0
+                self.count[key] = 0
+
+            self.sum[key] += value * n
+            self.count[key] += n
+
+    def flush(self):
+        avg_results = {}
+        for key in self.sum:
+            if self.count[key] > 0:
+                avg_results[key] = self.sum[key] / self.count[key]
+            else:
+                avg_results[key] = 0.0
+        fmt_string = " | ".join([f"{k}: {v:.6f}" for k, v in avg_results.items()])
+        # 계산 후 내부 상태 초기화 (다음 구간을 위해)
+        self.reset()
+        return fmt_string
+
+
+
+
+
+def log_to_console(console, msg, logger=None):
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    formatted_msg = f"{timestamp} - {msg}"
+    console.print(formatted_msg)
+
+
+
+# -----------------------------------------------------------------------------
+# Custom Dataset & Functions
+# -----------------------------------------------------------------------------
+class YDomainImageDataset(Dataset):
+    def __init__(self, root_dir, mode='train', crop_size=512):
+        self.root_dir = root_dir
+        self.mode = mode
+        self.crop_size = crop_size
+        self.image_paths = glob.glob(os.path.join(root_dir, "*.png"))
+        self.to_tensor = transforms.ToTensor()
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+
+        try:
+            img = Image.open(img_path).convert('RGB')
+        except:
+            return torch.zeros(1, self.crop_size, self.crop_size)
+
+        y_img = img.convert('YCbCr').split()[0]
+
+        if self.mode == 'train':
+            cropper = transforms.RandomCrop(self.crop_size, pad_if_needed=True)
+        else:
+            cropper = transforms.CenterCrop(self.crop_size)
+
+        y_img_cropped = cropper(y_img)
+
+        return self.to_tensor(y_img_cropped)
+
+
+
+def adjust_learning_rate(optimizer, epoch, base_lr, milestones, multipliers):
+    lr = base_lr
+    for mil, mult in zip(milestones, multipliers):
+        if epoch >= mil:
+            lr = base_lr * mult
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
+
+
+def process_patches(batch_images, patch_size, shuffle: bool):
+    # 1. GPU로 이동
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    img_gpu = batch_images.to(device) # Shape: [B, 1, 256, 256]
+
+    B, C, H, W = img_gpu.shape
+
+    # 2. Unfold를 사용하여 겹치지 않게 패치 추출
+    # stride=patch_size 로 설정하여 겹치지 않게 함
+    # unfold(dimension, size, step)
+    # 결과 Shape: [B, C, H_steps, W_steps, patch_h, patch_w]
+    # 256 / 8 = 32 이므로 H_steps, W_steps는 32가 됨
+    patches = img_gpu.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+
+    # 3. 차원 정리 (Flatten to Batch)
+    # 현재: [B, 1, 32, 32, 8, 8]
+    # 목표: [B * 32 * 32, 1, 8, 8]
+
+    # (1) 먼저 패치 개수 차원들을 배치 쪽으로 몰아주기 위해 permute
+    # [B, C, H_n, W_n, ph, pw] -> [B, H_n, W_n, C, ph, pw]
+    patches = patches.permute(0, 2, 3, 1, 4, 5).contiguous()
+
+    # (2) View를 통해 하나의 큰 배치로 병합
+    # -1은 자동으로 계산된 총 패치 수 (B * 32 * 32)
+    patches = patches.view(-1, C, patch_size, patch_size)
+
+    # 4. Batch 축을 랜덤하게 섞기 (Shuffle)
+    # 총 패치 개수만큼의 랜덤 인덱스 생성
+    total_patches = patches.size(0)
+    rand_idx = torch.randperm(total_patches).to(device)
+
+    shuffled_patches = patches[rand_idx]
+
+    return shuffled_patches
+
+
+
+
+def get_dct_basis_flattened(block_size=8):
+    """
+    8x8 DCT Basis를 생성하여 (64, 8, 8) 형태로 반환합니다.
+    Shape 설명: (Frequency_Index, Height, Width)
+    """
+    # 1. 1D DCT Matrix 생성 (Orthonormal)
+    n = torch.arange(block_size).float()
+    k = torch.arange(block_size).float()
+
+    # cos((2n+1)kπ / 2N)
+    dct_1d = torch.cos((2 * n.unsqueeze(1) + 1) * k.unsqueeze(0) * np.pi / (2 * block_size))
+
+    # Normalization factor (alpha)
+    alpha = torch.ones(block_size) * np.sqrt(2 / block_size)
+    alpha[0] = np.sqrt(1 / block_size)
+
+    # 1D Basis Matrix (Basis vectors are columns)
+    # dct_matrix[k, n] 형태로 만듦 (k: frequency, n: time/space)
+    dct_matrix = alpha.unsqueeze(1) * dct_1d.t()
+
+    # 2. 2D Basis 생성 (Outer Product)
+    # (u, v) 주파수에 해당하는 2D 기저 이미지 생성
+    basis_images = []
+
+    for u in range(block_size):
+        for v in range(block_size):
+            # 1D basis vector for u and v
+            basis_u = dct_matrix[u, :] # shape: (8,)
+            basis_v = dct_matrix[v, :] # shape: (8,)
+
+            # Outer product to make 8x8 basis image
+            basis_img = torch.outer(basis_u, basis_v)
+            basis_images.append(basis_img)
+
+    # 3. Stack하여 (64, 8, 8) 텐서 생성
+    # 순서는 (u=0,v=0), (u=0,v=1)... 순서로 flatten 됩니다.
+    dct_basis_64_8_8 = torch.stack(basis_images)    # (64, 8, 8)
+
+    return dct_basis_64_8_8
+
+
+def get_qmap():
+  qmap = np.array([
+        [16, 11, 10, 16, 24, 40, 51, 61],
+        [12, 12, 14, 19, 26, 58, 60, 55],
+        [14, 13, 16, 24, 40, 57, 69, 56],
+        [14, 17, 22, 29, 51, 87, 80, 62],
+        [18, 22, 37, 56, 68, 109, 103, 77],
+        [24, 35, 55, 64, 81, 104, 113, 92],
+        [49, 64, 78, 87, 103, 121, 120, 101],
+        [72, 92, 95, 98, 112, 100, 103, 99]
+    ], dtype=np.float32)
+  qmap = torch.from_numpy(qmap) / 255.0
+  return qmap.view(1, 1, 8, 8)
+
+
+def training_quantization(x):
+  return x - x.detach() + torch.round(x)
+
+
+
+# Loss function
+
+
+def mse_loss_fn(x, target):
+  mse_loss = F.mse_loss(x, target)
+  return mse_loss
+
+
+def bitrate_loss_fn(bits):
+  b, _, h, w = bits.size()
+  bitrate_loss = torch.sum(bits) / (b * h * w)
+  return bitrate_loss
+
+
+def rd_loss_fn(x, target, bits, lmbda):
+  mse_loss = mse_loss_fn(x, target)
+  bitrate_loss = bitrate_loss_fn(bits)
+  rd_loss = lmbda * mse_loss + bitrate_loss
+  return rd_loss, mse_loss, bitrate_loss
+
+
+
+
+
+### model
+def lower_bound_fwd(x: Tensor, bound: Tensor) -> Tensor:
+    return torch.max(x, bound)
+
+
+def lower_bound_bwd(x: Tensor, bound: Tensor, grad_output: Tensor):
+    pass_through_if = (x >= bound) | (grad_output < 0)
+    return pass_through_if * grad_output, None
+
+
+class LowerBoundFunction(torch.autograd.Function):
+    """Autograd function for the `LowerBound` operator."""
+
+    @staticmethod
+    def forward(ctx, x, bound):
+        ctx.save_for_backward(x, bound)
+        return lower_bound_fwd(x, bound)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, bound = ctx.saved_tensors
+        return lower_bound_bwd(x, bound, grad_output)
+
+
+class LowerBound(nn.Module):
+    bound: Tensor
+
+    def __init__(self, bound: float):
+        super().__init__()
+        self.register_buffer("bound", torch.Tensor([float(bound)]))
+
+    @torch.jit.unused
+    def lower_bound(self, x):
+        return LowerBoundFunction.apply(x, self.bound)
+
+    def forward(self, x):
+        if torch.jit.is_scripting():
+            return torch.max(x, self.bound)
+        return self.lower_bound(x)
+
+
+class NonNegativeParametrizer(nn.Module):
+    pedestal: Tensor
+
+    def __init__(self, minimum: float = 0, reparam_offset: float = 2**-18):
+        super().__init__()
+
+        self.minimum = float(minimum)
+        self.reparam_offset = float(reparam_offset)
+
+        pedestal = self.reparam_offset**2
+        self.register_buffer("pedestal", torch.Tensor([pedestal]))
+        bound = (self.minimum + self.reparam_offset**2) ** 0.5
+        self.lower_bound = LowerBound(bound)
+
+    def init(self, x: Tensor) -> Tensor:
+        return torch.sqrt(torch.max(x + self.pedestal, self.pedestal))
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = self.lower_bound(x)
+        out = out**2 - self.pedestal
+        return out
+
+
+class GDN(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        inverse: bool = False,
+        beta_min: float = 1e-6,
+        gamma_init: float = 0.1,
+    ):
+        super().__init__()
+
+        beta_min = float(beta_min)
+        gamma_init = float(gamma_init)
+        self.inverse = bool(inverse)
+
+        self.beta_reparam = NonNegativeParametrizer(minimum=beta_min)
+        beta = torch.ones(in_channels)
+        beta = self.beta_reparam.init(beta)
+        self.beta = nn.Parameter(beta)
+
+        self.gamma_reparam = NonNegativeParametrizer()
+        gamma = gamma_init * torch.eye(in_channels)
+        gamma = self.gamma_reparam.init(gamma)
+        self.gamma = nn.Parameter(gamma)
+
+    def forward(self, x: Tensor) -> Tensor:
+        _, C, _, _ = x.size()
+
+        beta = self.beta_reparam(self.beta)
+        gamma = self.gamma_reparam(self.gamma)
+        gamma = gamma.reshape(C, C, 1, 1)
+        norm = F.conv2d(x**2, gamma, beta)
+
+        if self.inverse:
+            norm = torch.sqrt(norm)
+        else:
+            norm = torch.rsqrt(norm)
+
+        out = x * norm
+        return out
+
+
+class ResidualBlk_1x1(nn.Module):
+    def __init__(self, ch):
+        super(ResidualBlk_1x1, self).__init__()
+        self.conv = nn.Sequential(
+            nn.LeakyReLU(),
+            nn.Conv2d(ch, ch, kernel_size=1, stride=1, padding=0),
+            nn.LeakyReLU(),
+            nn.Conv2d(ch, ch, kernel_size=1, stride=1, padding=0)
+        )
+    
+    def forward(self, x):
+        return self.conv(x) + x
+
+
+class GaussianEncoder(nn.Module):
+  def __init__(self):
+      super().__init__()
+      self.cdf_distribution = torch.distributions.laplace.Laplace
+      self.scale_min = 0.01
+      self.scale_max = 64.0
+      self.scale_level = 256
+
+      self.scale_table = self.get_scale_table()
+
+      self.log_scale_min = math.log(self.scale_min)
+      self.log_scale_max = math.log(self.scale_max)
+      self.log_scale_step = (self.log_scale_max - self.log_scale_min) / (self.scale_level - 1)
+
+      self.lower_bound_scale = LowerBound(self.scale_min)
+
+  def get_scale_table(self):
+      return torch.exp(torch.linspace(math.log(self.scale_min), math.log(self.scale_max), self.scale_level))
+
+  def likelihood_to_bits(self, likelihood):
+      entropy = -1.0 * torch.log(likelihood + 1e-5) / math.log(2.0)
+      entropy = torch.clamp_min(entropy, 0)
+      return entropy
+
+  def quantize(self, x, mode: str, means: Tensor = None):
+      if mode not in ("noise", "symbols"):
+          raise ValueError(f'Invalid quantization mode: "{mode}"')
+
+      if mode == "noise":
+          noise = torch.empty_like(x).uniform_(-0.5, 0.5)
+          out = x + noise
+          return out
+
+      elif mode == "symbols":
+          if means is not None:
+              x = x - means
+
+          out = torch.round(x)
+          symbols = out.int()
+
+          if means is not None:
+              out = out + means
+          return out, symbols
+
+      else:
+          raise ValueError(f'Invalid quantization mode: "{mode}"')
+
+  def _likelihood(self, x, scales, means=None):
+      mu = torch.zeros_like(scales)
+      scales = self.lower_bound_scale(scales)
+
+      dist = torch.distributions.laplace.Laplace(mu, scales)
+
+      if means is not None:
+          x = x - means
+      x = torch.abs(x)
+
+      likelihood = dist.cdf(x + 0.5) - dist.cdf(x - 0.5)
+      return likelihood
+
+  def forward(self, x_hat, scales, means=None):
+      likelihood = self._likelihood(x_hat, scales, means=means)
+      bits = self.likelihood_to_bits(likelihood)
+      return bits
+
+
+
+
+class MaskedConv2d(nn.Module):
+  def __init__(self, in_ch, out_ch):
+    super(MaskedConv2d, self).__init__()
+    mask = torch.Tensor([[0, 0, 0, 0, 0],
+                         [0, 0, 0, 1, 0],
+                         [0, 0, 0, 1, 0],
+                         [0, 0, 1, 1, 0],
+                         [0, 0, 0, 0, 0]])
+    self.register_buffer("mask", mask.view(1, 1, 5, 5))
+    self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=5, stride=1, padding=2)
+
+  def forward(self, x):
+    weight = self.conv.weight * self.mask
+    bias = self.conv.bias
+    out = F.conv2d(x, weight, bias, stride=1, padding=2)
+    return out
+
+
+
+class ContextModeler(nn.Module):
+  def __init__(self):
+    super(ContextModeler, self).__init__()
+    self.gaussian_encoder = GaussianEncoder()
+
+    self.masked_conv = MaskedConv2d(1, 96)
+    self.position_embedding = nn.Parameter(torch.randn(size=(1, 48, 8, 8)))
+    self.parameters_predictor = nn.Sequential(
+        nn.Conv2d(144, 256, kernel_size=1, stride=1, padding=0),
+        ResidualBlk_1x1(256),
+        ResidualBlk_1x1(256),
+        ResidualBlk_1x1(256),
+        nn.Conv2d(256, 1, kernel_size=1, stride=1, padding=0))
+
+  def forward(self, coefficients):
+    b, _, h, w = coefficients.size()
+
+    coefficients_hat = training_quantization(coefficients)
+    ctx_param = self.masked_conv(coefficients_hat)
+    pos_param = self.position_embedding.expand(b, -1, h, w)
+    scales = self.parameters_predictor(torch.cat((ctx_param, pos_param), dim=1))
+
+    bits = self.gaussian_encoder(coefficients_hat, scales, None)
+    return coefficients_hat, bits
+
+
+
+
+
+class Model(nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.context_modeler = ContextModeler()
+
+    dct_basis_64_8_8 = get_dct_basis_flattened()
+    self.register_buffer('dct_basis_64_8_8', dct_basis_64_8_8)
+
+    qmap = get_qmap()
+    self.qmap = nn.Parameter(qmap, requires_grad=True)
+
+  def forward(self, x):
+    # b, 1, 8, 8
+    x_tar = x
+    b = x.size(0)
+    x = x * 2 - 1
+
+    x_squeeze = x.squeeze(dim=1)
+    coefficients = torch.einsum('bhw, chw -> bc', x_squeeze, self.dct_basis_64_8_8)
+    coefficients = coefficients.view(b, 1, 8, 8)
+
+    qmap = torch.clamp_min(self.qmap, 1e-5)
+    coefficients = coefficients / qmap
+
+    coefficients_hat, bits = self.context_modeler(coefficients)
+
+    coefficients_hat = coefficients_hat * qmap
+    x_hat = torch.einsum('bc, chw -> bhw', coefficients_hat.view(b, -1), self.dct_basis_64_8_8).unsqueeze(dim=1)
+    x_hat = (x_hat + 1) / 2
+
+    rd_loss, mse_loss, bitrate_loss = rd_loss_fn(x_hat, x_tar, bits, 512)
+    logs_dict = {
+        "rd_loss": rd_loss.item(),
+        "mse_loss": mse_loss.item(),
+        "bitrate_loss": bitrate_loss.item()
+    }
+    return rd_loss, logs_dict
+
+
+
+# -----------------------------------------------------------------------------
+# Main Train Loop
+# -----------------------------------------------------------------------------
+
+
+def validate(model, val_loader, device, epoch, console):
+    model.eval()
+    meters = AccumulateMeter()
+
+    with torch.no_grad():
+        for inputs in val_loader:
+            inputs = process_patches(inputs, patch_size=8, shuffle=False)
+
+            total_loss, logs_dict = model(inputs)
+            meters.update(logs_dict)
+
+    msg = f"\n[Validation Epoch {epoch}] Result: {meters.flush()}"
+    log_to_console(console, msg)
+    log_to_console(console, "-" * 80 + "\n")
+
+
+
+
+def main():
+    console = Console()
+    log_to_console(console, "Loaded Configuration")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    train_dataset = YDomainImageDataset(train_dataset_path, mode='train')
+    val_dataset = YDomainImageDataset(val_dataset_path, mode='val')
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    model = Model().to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=base_lr)
+    start_epoch = 0
+
+    total_epochs = epochs
+    steps_per_epoch = len(train_loader)
+    total_steps = total_epochs * steps_per_epoch
+    current_global_step = start_epoch * steps_per_epoch
+
+    # [핵심 수정 1] Progress 정의에 TextColumn("{task.fields[info]}") 추가
+    # style="bold yellow" 등으로 색상 지정 가능
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        TextColumn("[bold yellow]{task.fields[info]}"), # <-- 여기에 동적 정보 표시
+        console=console
+    )
+
+    log_to_console(console, "Running initial validation...")
+    validate(model, val_loader, device, start_epoch - 1, console)
+
+    refresh_freq = 10
+    with progress:
+        # [핵심 수정 2] task 생성 시 info 필드 초기화
+        task_id = progress.add_task("[green]Training...", total=total_steps, completed=current_global_step, info="")
+
+        for epoch in range(start_epoch, total_epochs):
+            model.train()
+            meters = MovingAverageMeter()
+
+            curr_lr = adjust_learning_rate(optimizer, epoch,base_lr, lr_milestones, lr_multipliers)
+
+            if epoch == start_epoch:
+                log_to_console(console, f"Start Epoch {epoch}/{total_epochs} | LR: {curr_lr:.6f}")
+
+            for i, inputs in enumerate(train_loader):
+                inputs = process_patches(inputs, patch_size=8, shuffle=True)
+
+                total_loss, logs_dict = model(inputs)
+
+                optimizer.zero_grad()
+                total_loss.backward()
+                optimizer.step()
+
+                # Metric update
+                meters.update(logs_dict)
+
+                # [최적화된 로직]
+                # 1. 기본적으로 진행 바(Bar)는 매번 1칸씩 전진시킵니다.
+                advance_steps = 1
+
+                # 2. 텍스트 정보(info)는 특정 주기마다만 계산하고 업데이트합니다.
+                if (i + 1) % refresh_freq == 0:
+                    info_str = meters.get_str()
+                    info_str += f"    |   LR: {curr_lr:.6f}"
+                    progress.update(task_id, advance=advance_steps, info=info_str)
+                else:
+                    # 텍스트 갱신 없이 바만 전진 (훨씬 가벼움)
+                    progress.update(task_id, advance=advance_steps)
+
+            # Epoch 끝날 때 Validation
+            validate(model, val_loader, device, epoch, console)
+
+    log_to_console(console, "Training Finished.")
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
