@@ -1,0 +1,189 @@
+import bisect
+
+class RansEncoderDecoder:
+    """
+    rANS(range Asymmetric Numeral Systems)를 사용하여
+    심볼 시퀀스를 인코딩 및 디코딩하는 클래스.
+
+    각 심볼은 서로 다른 CMF(Cumulative Mass Function) 테이블을 가질 수 있습니다.
+    """
+
+    def __init__(self, precision_bits=20):
+        """
+        rANS 인코더/디코더를 초기화합니다.
+
+        Args:
+            precision_bits (int): 확률 모델의 정밀도.
+                                  총 빈도수 M = 2**precision_bits가 됩니다.
+        """
+        if not 16 <= precision_bits <= 30:
+            print(f"Warning: {precision_bits}bit 정밀도는 비효율적이거나 "
+                  "Python 정수 한계를 벗어날 수 있습니다. (권장: 20-30)")
+
+        self.precision_bits = precision_bits
+        # M: 확률의 총합 (분모)
+        self.M = 1 << self.precision_bits
+
+        # 비트스트림을 입출력할 청크(chunk) 크기 (32비트 사용)
+        self.CHUNK_BITS = 32
+        # 상태(state)가 이 값 미만으로 떨어지면 비트스트림에서 값을 읽어옴 (디코딩 시)
+        # 상태(state)가 이 값의 f배 이상이면 비트스트림으로 값을 씀 (인코딩 시)
+        self.LOWER_BOUND = 1 << self.CHUNK_BITS
+
+    def encode_to_payload(self, cmf_tables, indices):
+        """
+        심볼 인덱스 리스트를 비트스트림으로 인코딩합니다.
+        rANS는 LIFO(Last-In, First-Out) 방식으로, 리스트의 *역순*으로 인코딩합니다.
+
+        Args:
+            cmf_tables (list[list[int]]): 각 심볼에 해당하는 CMF 테이블의 리스트.
+                                          cmf_tables[i]는 indices[i]의 CMF 테이블.
+            indices (list[int]): 인코딩할 심볼의 인덱스 리스트.
+
+        Returns:
+            tuple: (final_state, bitstream_chunks)
+                   final_state (int): 인코딩 완료 후의 최종 상태.
+                   bitstream_chunks (list[int]): 생성된 비트스트림 (32비트 청크 리스트).
+        """
+        
+        # 인코딩은 M (또는 M ~ 2M-1 사이)에서 시작
+        state = self.M
+        bitstream_chunks = []
+
+        if len(cmf_tables) != len(indices):
+            raise ValueError("CMF 테이블 리스트와 인덱스 리스트의 길이가 다릅니다.")
+
+        # LIFO: 리스트의 역순으로 인코딩
+        for cmf, index in reversed(list(zip(cmf_tables, indices))):
+            if not (0 <= index < len(cmf) - 1):
+                raise ValueError(f"인덱스 {index}가 CMF 테이블(길이: {len(cmf)}) 범위를 벗어났습니다.")
+            
+            c = cmf[index]
+            f = cmf[index+1] - c  # f = 빈도수(frequency)
+
+            if f == 0:
+                raise ValueError(f"인덱스 {index}의 빈도수(f)가 0입니다. CMF 테이블 오류.")
+            if cmf[-1] != self.M:
+                raise ValueError(f"CMF 테이블이 정규화되지 않았습니다. "
+                                 f"cmf[-1] ({cmf[-1]}) != M ({self.M})")
+
+            # 1. 정규화 (Renormalization): 상태(state)가 너무 크면 비트스트림으로 배출
+            #    state >= f * LOWER_BOUND
+            while state >= (f << self.CHUNK_BITS):
+                bitstream_chunks.append(state & ((1 << self.CHUNK_BITS) - 1))
+                state >>= self.CHUNK_BITS
+
+            # 2. 인코딩 (상태 업데이트)
+            #    state = floor(state / f) * M + (state % f) + c
+            state = (state // f) * self.M + (state % f) + c
+
+        return state, bitstream_chunks
+
+    def decode_from_payload(self, cmf_tables, initial_state, bitstream_chunks):
+        """
+        비트스트림을 디코딩하여 원본 심볼 인덱스 리스트를 복원합니다.
+        rANS는 FIFO(First-In, First-Out) 방식으로, CMF 테이블의 *정순*으로 디코딩합니다.
+
+        Args:
+            cmf_tables (list[list[int]]): 인코딩에 사용된 CMF 테이블 리스트 (정순).
+            initial_state (int): 인코딩 후 반환된 final_state.
+            bitstream_chunks (list[int]): 인코딩 후 반환된 bitstream_chunks.
+
+        Returns:
+            list[int]: 디코딩된 심볼 인덱스 리스트.
+        """
+        
+        state = initial_state
+        # pop()을 사용하기 위해 리스트 복사 (원본 유지)
+        chunks = list(bitstream_chunks)
+        decoded_indices = []
+
+        # FIFO: CMF 테이블 리스트의 정순으로 디코딩
+        for cmf in cmf_tables:
+            if cmf[-1] != self.M:
+                raise ValueError(f"CMF 테이블이 정규화되지 않았습니다. "
+                                 f"cmf[-1] ({cmf[-1]}) != M ({self.M})")
+                                 
+            # 1. 심볼 찾기 (state % M)
+            slot = state & (self.M - 1)
+
+            # 이진 탐색으로 'index'를 찾음: cmf[index] <= slot < cmf[index+1]
+            index = bisect.bisect_right(cmf, slot) - 1
+
+            if not (0 <= index < len(cmf) - 1):
+                raise ValueError(f"디코딩 실패: slot {slot}이 CMF 범위에 없습니다.")
+
+            decoded_indices.append(index)
+
+            c = cmf[index]
+            f = cmf[index+1] - c  # f = 빈도수(frequency)
+
+            # 2. 디코딩 (상태 업데이트)
+            #    state = f * floor(state / M) + (state % M) - c
+            state = f * (state >> self.precision_bits) + slot - c
+
+            # 3. 정규화 (Renormalization): 상태(state)가 너무 작으면 비트스트림에서 읽어옴
+            while state < self.LOWER_BOUND and chunks:
+                bits = chunks.pop()
+                state = (state << self.CHUNK_BITS) | bits
+
+        return decoded_indices
+
+
+
+
+if __name__ == "__main__":
+    # 1. 인코딩/디코딩 설정
+    PRECISION = 10
+    M = 1 << PRECISION  # M = 1024
+
+    rans = RansEncoderDecoder(precision_bits=PRECISION)
+
+    # 2. 인코딩할 데이터 준비
+    # 서로 다른 확률 모델을 가진 3개의 심볼을 가정
+    
+    # 심볼 0 (3가지 경우): [0.3, 0.3, 0.4]
+    cmf_0 = [0, 307, 614, 1024]  # 307/1024, 307/1024, 410/1024 (반올림 오차)
+    
+    # 심볼 1 (2가지 경우): [0.5, 0.5]
+    cmf_1 = [0, 512, 1024]
+    
+    # 심볼 2 (4가지 경우): [0.1, 0.2, 0.6, 0.1]
+    cmf_2 = [0, 102, 307, 922, 1024]
+
+    # 인코딩할 CMF 테이블 리스트와 인덱스 리스트
+    all_cmf_tables = [cmf_0, cmf_1, cmf_2, cmf_0]
+    symbol_indices = [1,      0,     3,     2] # 심볼0의 1번, 심볼1의 0번, ...
+
+    print(f"Original Indices: {symbol_indices}")
+    print(f"Using CMF tables (lengths): {[len(c) for c in all_cmf_tables]}")
+    print("-" * 30)
+
+    # 3. 인코딩 수행
+    try:
+        final_state, bitstream = rans.encode_to_payload(all_cmf_tables, symbol_indices)
+        
+        print(f"Encoding successful.")
+        print(f"Final State: {final_state}")
+        print(f"Bitstream Chunks: {bitstream} (청크 {len(bitstream)}개)")
+        print("-" * 30)
+
+        # 4. 디코딩 수행
+        # ※ 주의: 디코더는 인코딩과 '동일한 순서'의 CMF 테이블 리스트가 필요합니다.
+        decoded_indices = rans.decode_from_payload(all_cmf_tables, final_state, bitstream)
+
+        print(f"Decoding successful.")
+        print(f"Decoded Indices:  {decoded_indices}")
+
+        # 5. 검증
+        assert symbol_indices == decoded_indices
+        print("\nVerification: SUCCESS! (Original == Decoded)")
+
+    except ValueError as e:
+        print(f"\nError: {e}")
+
+
+
+
+
+
