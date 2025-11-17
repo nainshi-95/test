@@ -1,9 +1,10 @@
 import bisect
+import struct  # 32비트 정수 <-> bytes 변환을 위해 추가
 
 class RansEncoderDecoder:
     """
     rANS(range Asymmetric Numeral Systems)를 사용하여
-    심볼 시퀀스를 인코딩 및 디코딩하는 클래스. (Flush/Set_Bitstream 기능 포함)
+    심볼 시퀀스를 인코딩 및 디코딩하는 클래스. (바이너리 파일 I/O 지원)
     """
 
     def __init__(self, precision_bits=20):
@@ -15,26 +16,23 @@ class RansEncoderDecoder:
         self.M = 1 << self.precision_bits  # 확률의 총합 (분모)
 
         self.CHUNK_BITS = 32
+        self.CHUNK_BYTES = self.CHUNK_BITS // 8  # 4 바이트
         self.LOWER_BOUND = 1 << self.CHUNK_BITS
 
-        # 64비트(청크 2개)로 상태를 저장한다고 가정합니다.
+        # 64비트(청크 2개)로 상태를 저장
         self.STATE_CHUNKS = 2
 
         # 내부 상태 변수
         self.encode_state = self.M
-        self.encode_bitstream = []
+        self.encode_bitstream = []  # list[int]
         
         self.decode_state = 0
-        self.decode_bitstream = []
+        self.decode_bitstream = []  # list[int]
 
     def encode(self, cmf_tables, indices):
         """
         심볼 인덱스 리스트를 인코딩하여 내부 상태를 업데이트합니다.
-        rANS는 LIFO(Last-In, First-Out) 방식으로, 리스트의 *역순*으로 인코딩합니다.
-
-        Args:
-            cmf_tables (list[list[int]]): 각 심볼에 해당하는 CMF 테이블의 리스트.
-            indices (list[int]): 인코딩할 심볼의 인덱스 리스트.
+        (이전 버전과 동일)
         """
         
         if len(cmf_tables) != len(indices):
@@ -62,49 +60,67 @@ class RansEncoderDecoder:
             # 2. 인코딩 (상태 업데이트)
             self.encode_state = (self.encode_state // f) * self.M + (self.encode_state % f) + c
 
-    def flush(self):
+    def flush(self) -> bytes:
         """
-        인코딩을 완료하고, 최종 상태를 포함한 전체 비트스트림을 반환합니다.
+        인코딩을 완료하고, 최종 상태를 포함한 전체 비트스트림을 'bytes' 객체로 반환합니다.
         인코더의 상태는 초기화됩니다.
 
         Returns:
-            list[int]: 최종 비트스트림 (32비트 청크 리스트).
+            bytes: 파일 저장이 가능한 최종 바이너리 비트스트림.
         """
         
-        # 현재 비트스트림을 복사
-        final_stream = list(self.encode_bitstream)
+        # 32비트 정수 청크 리스트를 생성
+        final_stream_chunks = list(self.encode_bitstream)
         
         state = self.encode_state
         
-        # LIFO: 최종 상태(state)를 비트스트림의 *끝*에 추가합니다.
-        # 디코더가 pop()으로 가장 먼저 읽을 데이터입니다.
-        # 여기서는 64비트(청크 2개)로 상태를 저장합니다.
+        # LIFO: 최종 상태(state)를 64비트(청크 2개)로 리스트 *끝*에 추가
         for _ in range(self.STATE_CHUNKS):
-            final_stream.append(state & ((1 << self.CHUNK_BITS) - 1))
+            final_stream_chunks.append(state & ((1 << self.CHUNK_BITS) - 1))
             state >>= self.CHUNK_BITS
 
         if state != 0:
              print(f"Warning: 인코더 상태가 {self.STATE_CHUNKS}개 청크(64비트)를 초과했습니다.")
 
+        # [수정] list[int] -> bytes 변환
+        try:
+            # '<' : 리틀 엔디안
+            # 'I' : 32비트 부호 없는 정수 (unsigned int)
+            num_chunks = len(final_stream_chunks)
+            packed_bytes = struct.pack(f'<{num_chunks}I', *final_stream_chunks)
+        except struct.error as e:
+            raise IOError(f"비트스트림 패킹 실패: {e}")
+
         # 인코더 상태 리셋
         self.encode_state = self.M
         self.encode_bitstream = []
 
-        return final_stream
+        return packed_bytes
 
-    def set_bitstream(self, bitstream_chunks):
+    def set_bitstream(self, bitstream_bytes: bytes):
         """
-        디코딩을 위해 비트스트림을 설정합니다.
+        디코딩을 위해 'bytes' 비트스트림을 설정합니다.
         비트스트림에서 초기 상태(state)를 읽어오고, 나머지를 저장합니다.
 
         Args:
-            bitstream_chunks (list[int]): flush()에서 반환된 전체 비트스트림.
+            bitstream_bytes (bytes): flush()에서 반환된 전체 바이너리 비트스트림.
         """
-        if not bitstream_chunks or len(bitstream_chunks) < self.STATE_CHUNKS:
-            raise ValueError("비트스트림이 비어있거나 상태(state) 정보를 읽기에 너무 짧습니다.")
-            
-        self.decode_bitstream = list(bitstream_chunks)
+        if not bitstream_bytes or len(bitstream_bytes) % self.CHUNK_BYTES != 0:
+            raise ValueError(f"비트스트림 크기가 {self.CHUNK_BYTES}바이트 배수가 아닙니다 (데이터 손상 가능성).")
+
+        num_chunks = len(bitstream_bytes) // self.CHUNK_BYTES
         
+        if num_chunks < self.STATE_CHUNKS:
+             raise ValueError("비트스트림이 상태(state) 정보를 읽기에 너무 짧습니다.")
+            
+        # [수정] bytes -> list[int] 변환
+        try:
+            unpacked_tuple = struct.unpack(f'<{num_chunks}I', bitstream_bytes)
+            # 디코더는 pop()을 사용하므로 list로 변환
+            self.decode_bitstream = list(unpacked_tuple) 
+        except struct.error as e:
+            raise IOError(f"비트스트림 언패킹 실패: {e}")
+
         # LIFO: 비트스트림의 *끝*에서 상태(state)를 읽어옵니다. (flush()와 대칭)
         state = 0
         for i in range(self.STATE_CHUNKS):
@@ -116,13 +132,7 @@ class RansEncoderDecoder:
     def decode(self, cmf_tables):
         """
         설정된 비트스트림과 CMF 테이블을 사용하여 심볼 인덱스 리스트를 복원합니다.
-        rANS는 FIFO(First-In, First-Out) 방식으로, CMF 테이블의 *정순*으로 디코딩합니다.
-
-        Args:
-            cmf_tables (list[list[int]]): 인코딩에 사용된 CMF 테이블 리스트 (정순).
-
-        Returns:
-            list[int]: 디코딩된 심볼 인덱스 리스트.
+        (이전 버전과 동일)
         """
         
         state = self.decode_state
@@ -157,21 +167,17 @@ class RansEncoderDecoder:
                 bits = chunks.pop()
                 state = (state << self.CHUNK_BITS) | bits
         
-        # 나중을 위해 최종 상태 저장 (필수는 아님)
         self.decode_state = state
         self.decode_bitstream = chunks
 
         return decoded_indices
 
 
-
-
-
-
 if __name__ == "__main__":
     # 1. 설정
     PRECISION = 10
     M = 1 << PRECISION  # M = 1024
+    FILE_NAME = "encoded_data.bin"
 
     # 2. 인코딩할 데이터 준비
     cmf_0 = [0, 307, 614, 1024]
@@ -184,26 +190,33 @@ if __name__ == "__main__":
     print(f"Original Indices: {symbol_indices}")
     print("-" * 30)
 
-    # 3. 인코딩
+    # 3. 인코딩 및 파일 저장
     encoder = RansEncoderDecoder(precision_bits=PRECISION)
     try:
-        # 심볼 인코딩 (내부 상태에 저장됨)
         encoder.encode(all_cmf_tables, symbol_indices)
         
-        # 인코딩 완료 후 flush() 호출
-        bitstream = encoder.flush()
+        # flush()는 이제 bytes를 반환
+        binary_bitstream = encoder.flush()
         
         print(f"Encoding successful.")
-        print(f"Total Bitstream Chunks: {len(bitstream)}")
-        # print(f"Bitstream (state included): {bitstream}")
+        print(f"Total bytes written: {len(binary_bitstream)}")
+
+        # 파일에 바이너리 쓰기
+        with open(FILE_NAME, "wb") as f:
+            f.write(binary_bitstream)
+        print(f"File '{FILE_NAME}' saved.")
         print("-" * 30)
 
-        # 4. 디코딩
-        #    (새 인스턴스를 사용하거나, 동일 인스턴스를 사용해도 됩니다)
+        # 4. 파일 읽기 및 디코딩
         decoder = RansEncoderDecoder(precision_bits=PRECISION)
         
-        # (필수) 디코딩 전 set_bitstream() 호출
-        decoder.set_bitstream(bitstream)
+        # 파일에서 바이너리 읽기
+        print(f"Reading file '{FILE_NAME}'...")
+        with open(FILE_NAME, "rb") as f:
+            read_bitstream = f.read()
+
+        # (필수) 디코딩 전 set_bitstream(bytes) 호출
+        decoder.set_bitstream(read_bitstream)
         
         # CMF 테이블을 순서대로 전달하여 디코딩
         decoded_indices = decoder.decode(all_cmf_tables)
@@ -215,8 +228,9 @@ if __name__ == "__main__":
         assert symbol_indices == decoded_indices
         print("\nVerification: SUCCESS! (Original == Decoded)")
 
-    except ValueError as e:
+    except (ValueError, IOError) as e:
         print(f"\nError: {e}")
+
 
 
 
