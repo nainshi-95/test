@@ -1,0 +1,544 @@
+import bisect
+import collections
+import enum
+import math
+import struct
+import threading
+from dataclasses import dataclass, field
+from typing import List, Deque, Optional, Tuple, Sequence
+
+# ----------------------------------------------------------------------------
+# 1. Rans64 헬퍼 클래스 (C++의 rans64.h 기능 구현)
+# ----------------------------------------------------------------------------
+
+class Rans64:
+    """
+    C++의 rans64.h 라이브러리 함수들을 Python으로 구현한 헬퍼 클래스입니다.
+    64비트 상태(state)와 32비트 워드(word) 단위의 입출력을 사용합니다.
+    """
+    
+    # rANS 상태의 하한 (Lower bound)
+    RANS64_L = (1 << 32)
+    
+    # 기본 확률 정밀도 (C++의 'precision')
+    PRECISION = 16
+    
+    # 바이패스 모드 비트 수 (C++의 'bypass_precision')
+    BYPASS_PRECISION = 4
+    MAX_BYPASS_VAL = (1 << BYPASS_PRECISION) - 1
+
+    @staticmethod
+    def enc_init() -> int:
+        """Rans64EncInit: 인코더 상태를 초기화합니다."""
+        return Rans64.RANS64_L
+
+    @staticmethod
+    def enc_flush(state: int, output_words: List[int]):
+        """
+        Rans64EncFlush: 마지막 상태를 32비트 워드 2개로 출력 버퍼에 씁니다.
+        (Python에서는 리스트 append로 구현)
+        """
+        output_words.append(state & 0xFFFFFFFF)
+        output_words.append((state >> 32) & 0xFFFFFFFF)
+
+    @staticmethod
+    def enc_put(state: int, start: int, freq: int, precision: int, 
+                output_words: List[int]) -> int:
+        """
+        Rans64EncPut: rANS 심볼 하나를 인코딩합니다.
+        (renormalization 포함)
+        """
+        scale = 1 << precision
+        
+        # x_max = ((RANS64_L >> precision) << 32) * freq
+        # (1ULL << (64 - precision)) * freq 와 동일
+        x_max = ((Rans64.RANS64_L >> precision) << 32) * freq
+        
+        if state >= x_max:
+            output_words.append(state & 0xFFFFFFFF)
+            state >>= 32
+            
+        # x = C(s, x)
+        # (state // freq) * scale + (state % freq) + start
+        return (state // freq) * scale + (state % freq) + start
+
+    @staticmethod
+    def enc_put_bits(state: int, val: int, n_bits: int, 
+                     output_words: List[int]) -> int:
+        """
+        Rans64EncPutBits: rANS 상태에 원시 비트(val)를 씁니다.
+        (Bypass 모드용)
+        """
+        # (1ULL << (64 - n_bits))
+        x_max = 1 << (64 - n_bits)
+        
+        if state >= x_max:
+            output_words.append(state & 0xFFFFFFFF)
+            state >>= 32
+            
+        return (state << n_bits) | val
+
+    @staticmethod
+    def dec_init(stream_words: Sequence[int]) -> Tuple[int, int]:
+        """
+        Rans64DecInit: 스트림에서 32비트 워드 2개를 읽어 디코더 상태를 초기화합니다.
+        """
+        state = (stream_words[0] & 0xFFFFFFFF) | \
+                ((stream_words[1] & 0xFFFFFFFF) << 32)
+        ptr_idx = 2  # 다음 읽을 워드 인덱스
+        return state, ptr_idx
+
+    @staticmethod
+    def dec_get(state: int, precision: int) -> int:
+        """Rans64DecGet: 현재 상태에서 누적 빈도(cumulative frequency)를 읽습니다."""
+        scale = 1 << precision
+        return state & (scale - 1)
+
+    @staticmethod
+    def dec_advance(state: int, ptr_idx: int, 
+                    start: int, freq: int, precision: int, 
+                    stream_words: Sequence[int]) -> Tuple[int, int]:
+        """
+        Rans64DecAdvance: 심볼(start, freq)을 기반으로 디코더 상태를 업데이트합니다.
+        (renormalization 포함)
+        """
+        scale = 1 << precision
+        
+        # x = D(s, x)
+        state = freq * (state >> precision) + (state & (scale - 1)) - start
+        
+        if state < Rans64.RANS64_L:
+            state = (state << 32) | (stream_words[ptr_idx] & 0xFFFFFFFF)
+            ptr_idx += 1
+            
+        return state, ptr_idx
+
+    @staticmethod
+    def dec_get_bits(state: int, ptr_idx: int, n_bits: int, 
+                     stream_words: Sequence[int]) -> Tuple[int, int, int]:
+        """
+        Rans64DecGetBits: rANS 상태에서 원시 비트(val)를 읽습니다.
+        (Bypass 모드용)
+        """
+        val = state & ((1 << n_bits) - 1)
+        state >>= n_bits
+        
+        if state < Rans64.RANS64_L:
+            state = (state << 32) | (stream_words[ptr_idx] & 0xFFFFFFFF)
+            ptr_idx += 1
+            
+        return val, state, ptr_idx
+
+# ----------------------------------------------------------------------------
+# 2. C++ .h 파일의 자료구조 변환
+# ----------------------------------------------------------------------------
+
+@dataclass
+class RansSymbol:
+    """struct RansSymbol"""
+    start: int  # uint16_t
+    range: int  # uint16_t
+    bypass: bool
+
+class WorkType(enum.Enum):
+    """enum class WorkType"""
+    Encode = 0
+    Flush = 1
+
+@dataclass
+class PendingTask:
+    """struct PendingTask"""
+    workType: WorkType
+    symbols: Optional[List[int]] = None       # int16_t -> int
+    indexes: Optional[List[int]] = None       # int16_t -> int
+    cdfs: Optional[List[List[int]]] = None  # int32_t -> int
+    cdfs_sizes: Optional[List[int]] = None    # int32_t -> int
+    offsets: Optional[List[int]] = None       # int32_t -> int
+
+# ----------------------------------------------------------------------------
+# 3. RansEncoderLib (기본 인코더)
+# ----------------------------------------------------------------------------
+
+class RansEncoderLib:
+    """class RansEncoderLib"""
+    def __init__(self):
+        self._syms: List[RansSymbol] = []
+        self._stream: bytes = b""
+
+    def reset(self):
+        """virtual void reset()"""
+        self._syms.clear()
+        self._stream = b""
+
+    def get_encoded_stream(self) -> bytes:
+        """virtual std::vector<uint8_t> get_encoded_stream()"""
+        return self._stream
+
+    def encode_with_indexes(
+        self,
+        symbols: List[int],     # int16_t
+        indexes: List[int],     # int16_t
+        cdfs: List[List[int]],  # int32_t
+        cdfs_sizes: List[int],  # int32_t
+        offsets: List[int]      # int32_t
+    ):
+        """virtual void encode_with_indexes(...)"""
+        
+        # C++: "backward loop on symbols from the end"
+        for i in range(len(symbols) - 1, -1, -1):
+            cdf_idx = indexes[i]
+            if cdf_idx < 0:
+                continue
+            
+            cdf = cdfs[cdf_idx]
+            max_value = cdfs_sizes[cdf_idx] - 2
+            value = symbols[i] - offsets[cdf_idx]
+
+            raw_val = 0
+            if value < 0:
+                raw_val = -2 * value - 1
+                value = max_value
+            elif value >= max_value:
+                raw_val = 2 * (value - max_value)
+                value = max_value
+
+            self._syms.append(RansSymbol(
+                start=cdf[value],
+                range=cdf[value + 1] - cdf[value],
+                bypass=False
+            ))
+
+            # Bypass coding mode (value == max_value -> sentinel flag)
+            if value == max_value:
+                # Determine the number of bypasses
+                n_bypass = 0
+                # C++: while ((raw_val >> (n_bypass * bypass_precision)) != 0)
+                if raw_val > 0:
+                     # 0을 비트연산하면 0이므로 +1
+                    n_bypass = (raw_val.bit_length() + Rans64.BYPASS_PRECISION - 1) // Rans64.BYPASS_PRECISION
+
+                # Encode number of bypasses
+                val = n_bypass
+                while val >= Rans64.MAX_BYPASS_VAL:
+                    self._syms.append(RansSymbol(
+                        start=Rans64.MAX_BYPASS_VAL,
+                        range=Rans64.MAX_BYPASS_VAL + 1, # C++ 코드 버그? start, range가 같음. 원본 존중.
+                        bypass=True
+                    ))
+                    val -= Rans64.MAX_BYPASS_VAL
+                
+                self._syms.append(RansSymbol(
+                    start=val,
+                    range=val + 1, # C++ 코드 버그? start, range가 같음. 원본 존중.
+                    bypass=True
+                ))
+                
+                # C++ 원본 (rans.cpp:115)을 보면:
+                # _syms.push_back({max_bypass_val, max_bypass_val + 1, true});
+                # _syms.push_back({static_cast<uint16_t>(val), static_cast<uint16_t>(val + 1), true});
+                # range가 start + 1로 되어 있습니다. 
+                # 하지만 Python 코드에서는 range를 사용하지 않으므로(enc_put_bits는 val만 씀)
+                # 원본의 start 값만 정확히 따릅니다.
+                
+                # 원본 C++ 코드는 range에 start+1을 넣지만, enc_put_bits는 start(val)만 사용합니다.
+                # C++ 코드의 의도대로 start=val, range=val+1, bypass=true로 수정합니다.
+                
+                # 위 두 push_back을 C++ 의도에 맞게 수정:
+                # (이미 RansSymbol(start=val, range=val+1, ...)로 되어 있음 - 단, max_bypass_val 부분)
+                # C++: _syms.push_back({max_bypass_val, max_bypass_val + 1, true});
+                # C++: _syms.push_back({static_cast<uint16_t>(val), static_cast<uint16_t>(val + 1), true});
+                # -> 이 부분은 디코더 Rans64DecGetBits에서 start(val)만 사용하므로
+                #    Python의 Rans64.dec_get_bits(state) 구현이 start, range를 안 쓴다면 괜찮습니다.
+                #    ...확인 결과:
+                #    C++ RansEncoderLib::flush() 에서는
+                #    Rans64EncPutBits(&rans, &ptr, sym.start, bypass_precision);
+                #    C++ RansDecoderLib::decode_stream() 에서는
+                #    val = Rans64DecGetBits(&_rans, &_ptr, bypass_precision);
+                #    즉, bypass 심볼은 'start' 값만 사용하고 'range'는 무시됩니다.
+                #    따라서 C++ 코드에서 range에 start+1을 넣은 것은 의미가 없습니다.
+                #    Python 구현(Rans64.enc_put_bits)도 start(val)만 사용합니다.
+                #    -> C++ 원본 코드를 다시 보니, `Rans64EncPutBits`가 `sym.start`만 씁니다.
+                #       `RansSymbol` 생성 시 range는 start+1로 되어 있으나 무시됩니다.
+                #       따라서 `sym.start`에 인코딩할 값(val)을 넣는 것이 맞습니다.
+                #       (위 코드의 `start=val`, `start=Rans64.MAX_BYPASS_VAL`이 맞습니다.)
+
+
+                # Encode raw value
+                for j in range(n_bypass):
+                    val1 = (raw_val >> (j * Rans64.BYPASS_PRECISION)) & Rans64.MAX_BYPASS_VAL
+                    self._syms.append(RansSymbol(
+                        start=val1,
+                        range=val1 + 1, # 이 값은 무시됨
+                        bypass=True
+                    ))
+
+    def flush(self):
+        """virtual void flush()"""
+        state = Rans64.enc_init()
+        
+        # C++은 거꾸로 쓰는 포인터를 사용하지만, Python은 리스트 append 후 reverse가 편합니다.
+        # Rans64.enc_put/enc_flush가 output_words.append()를 사용하므로,
+        # LIFO 순서를 맞추기 위해 _syms를 뒤집어서 순회합니다.
+        output_words: List[int] = [] 
+
+        # C++: while (!_syms.empty()) { const RansSymbol sym = _syms.back(); ... _syms.pop_back(); }
+        for sym in reversed(self._syms):
+            if not sym.bypass:
+                state = Rans64.enc_put(state, sym.start, sym.range, 
+                                       Rans64.PRECISION, output_words)
+            else:
+                state = Rans64.enc_put_bits(state, sym.start, 
+                                            Rans64.BYPASS_PRECISION, output_words)
+        
+        Rans64.enc_flush(state, output_words)
+        
+        # C++: memcpy(_stream.data(), ptr, nbytes);
+        # output_words (List[int]) -> bytes (little-endian, 32-bit words)
+        # C++ 코드는 ptr이 끝에서 시작해 앞으로 이동했으므로, 
+        # Python 리스트(append로 빌드됨)는 순서가 반대입니다.
+        # Rans64.enc_flush가 마지막에 호출되었으므로, 리스트를 뒤집어줘야 합니다.
+        
+        # C++ 코드를 다시 봅시다:
+        # uint32_t *ptr = output.data() + output.size(); (버퍼의 끝)
+        # Rans64EncPut(&rans, &ptr, ...);
+        # Rans64EncPut (rans64.h) 구현은 *(--ptr) = (uint32_t)x; 입니다. (포인터 감소)
+        # Rans64.enc_put (Python)은 output_words.append() 입니다. (순방향 빌드)
+        
+        # 따라서 Python의 output_words는 C++의 ptr이 생성한 메모리 청크의
+        # *역순*입니다. (LIFO 순서대로 append 되었음)
+        # C++은 최종 ptr ~ output.data() + output.size() 만큼을 memcpy 합니다.
+        # Python은 output_words를 뒤집어서 바이트로 변환해야 C++과 동일한 스트림이 됩니다.
+        
+        buffer = bytearray()
+        for word in reversed(output_words):
+            # 32비트 부호 없는 정수, 리틀 엔디안
+            buffer.extend(word.to_bytes(4, 'little', signed=False))
+            
+        self._stream = bytes(buffer)
+
+
+# ----------------------------------------------------------------------------
+# 4. RansEncoderLibMultiThread (멀티스레드 인코더)
+# ----------------------------------------------------------------------------
+
+class RansEncoderLibMultiThread(RansEncoderLib):
+    """class RansEncoderLibMultiThread"""
+    def __init__(self):
+        super().__init__()
+        self.m_finish = False
+        self.m_result_ready = False
+        
+        # Python의 Lock은 C++의 mutex와 동일하게 작동
+        self.m_mutex_pending = threading.Lock()
+        self.m_mutex_result = threading.Lock()
+        
+        # Condition 변수는 Lock과 함께 사용
+        self.m_cv_pending = threading.Condition(self.m_mutex_pending)
+        self.m_cv_result = threading.Condition(self.m_mutex_result)
+        
+        # C++의 std::list<PendingTask> m_pending (FIFO 큐로 사용됨)
+        self.m_pending: Deque[PendingTask] = collections.deque()
+        
+        self.m_thread = threading.Thread(target=self.worker, daemon=True)
+        self.m_thread.start()
+
+    def close(self):
+        """C++의 소멸자(~RansEncoderLibMultiThread)에 해당하는 정리 메서드"""
+        with self.m_mutex_pending:
+            # result 락도 잡으라는 C++ 소멸자 로직 (데드락 방지?)
+            with self.m_mutex_result:
+                self.m_finish = True
+        
+        self.m_cv_pending.notify()
+        self.m_cv_result.notify() # C++ 소멸자 로S logic
+        self.m_thread.join()
+
+    def encode_with_indexes(
+        self,
+        symbols: List[int],     # int16_t
+        indexes: List[int],     # int16_t
+        cdfs: List[List[int]],  # int32_t
+        cdfs_sizes: List[int],  # int32_t
+        offsets: List[int]      # int32_t
+    ):
+        """virtual void encode_with_indexes(...)"""
+        p = PendingTask(
+            workType=WorkType.Encode,
+            symbols=symbols,
+            indexes=indexes,
+            cdfs=cdfs,
+            cdfs_sizes=cdfs_sizes,
+            offsets=offsets
+        )
+        with self.m_mutex_pending:
+            self.m_pending.append(p)
+            self.m_cv_pending.notify() # m_cv_pending.notify_one()
+
+    def flush(self):
+        """virtual void flush()"""
+        p = PendingTask(workType=WorkType.Flush)
+        with self.m_mutex_pending:
+            self.m_pending.append(p)
+            self.m_cv_pending.notify()
+
+    def get_encoded_stream(self) -> bytes:
+        """virtual std::vector<uint8_t> get_encoded_stream()"""
+        with self.m_mutex_result:
+            # C++: m_cv_result.wait(lk, [this] { return m_result_ready || m_finish; });
+            self.m_cv_result.wait_for(lambda: self.m_result_ready or self.m_finish)
+            return super().get_encoded_stream()
+
+    def reset(self):
+        """virtual void reset()"""
+        super().reset()
+        with self.m_mutex_result:
+            self.m_result_ready = False
+
+    def worker(self):
+        """void worker()"""
+        while True:
+            tasks_to_process: Deque[PendingTask] = collections.deque()
+            
+            with self.m_mutex_pending:
+                # C++: m_cv_pending.wait(lk, [this] { return m_pending.size() > 0 || m_finish; });
+                self.m_cv_pending.wait_for(lambda: len(self.m_pending) > 0 or self.m_finish)
+                
+                if self.m_finish:
+                    break
+                
+                # C++의 내부 루프(while (m_pending.size() > 0))처럼 큐를 배출
+                while len(self.m_pending) > 0:
+                    tasks_to_process.append(self.m_pending.popleft())
+
+            # (Lock이 해제된 상태에서 작업 수행)
+            for p in tasks_to_process:
+                if p.workType == WorkType.Encode:
+                    # 부모(RansEncoderLib)의 인코딩 메서드 호출
+                    super().encode_with_indexes(
+                        p.symbols, p.indexes, p.cdfs, p.cdfs_sizes, p.offsets
+                    )
+                elif p.workType == WorkType.Flush:
+                    super().flush()
+                    with self.m_mutex_result:
+                        self.m_result_ready = True
+                    self.m_cv_result.notify() # m_cv_result.notify_one()
+
+# ----------------------------------------------------------------------------
+# 5. RansDecoderLib (디코더)
+# ----------------------------------------------------------------------------
+
+class RansDecoderLib:
+    """class RansDecoderLib"""
+    def __init__(self):
+        self._rans_state: int = 0
+        self._ptr_idx: int = 0
+        self._stream: bytes = b""
+        self._stream_words: List[int] = []
+
+    def set_stream(self, encoded: bytes):
+        """void set_stream(...)"""
+        self._stream = encoded
+        
+        # C++: _ptr = (uint32_t *)(_stream->data());
+        # Python: 바이트 스트림을 32비트 워드 리스트로 변환
+        self._stream_words = []
+        for i in range(0, len(encoded), 4):
+            word_bytes = encoded[i:i+4]
+            if len(word_bytes) < 4:
+                # 패딩이 안 맞으면 에러 (C++도 동일하게 깨질 것)
+                # C++ 코드는 32비트 정렬을 가정함
+                pass
+            self._stream_words.append(
+                int.from_bytes(word_bytes, 'little', signed=False)
+            )
+
+        # Rans64DecInit(&_rans, &_ptr);
+        self._rans_state, self._ptr_idx = Rans64.dec_init(self._stream_words)
+
+    def decode_stream(
+        self,
+        indexes: List[int],     # int16_t
+        cdfs: List[List[int]],  # int32_t
+        cdfs_sizes: List[int],  # int32_t
+        offsets: List[int]      # int32_t
+    ) -> List[int]:
+        """virtual std::vector<int16_t> decode_stream(...)"""
+        
+        index_size = len(indexes)
+        output = [0] * index_size
+
+        for i in range(index_size):
+            cdf_idx = indexes[i]
+            offset = offsets[cdf_idx]
+            
+            if cdf_idx < 0:
+                output[i] = offset
+                continue
+
+            cdf = cdfs[cdf_idx]
+            cdf_size = cdfs_sizes[cdf_idx]
+            max_value = cdf_size - 2
+            
+            # const uint32_t cum_freq = Rans64DecGet(&_rans, precision);
+            cum_freq = Rans64.dec_get(self._rans_state, Rans64.PRECISION)
+            
+            # C++:
+            # const auto cdf_end = cdf + cdfs_sizes_ptr[cdf_idx];
+            # const auto it = std::find_if(cdf, cdf_end, [cum_freq](int v) {
+            #   return static_cast<uint32_t>(v) > cum_freq;
+            # });
+            # const uint32_t s = static_cast<uint32_t>(std::distance(cdf, it) - 1);
+            
+            # Python (bisect_right가 C++의 std::find_if + distance - 1과 동일)
+            # bisect_right: cdf[k] > cum_freq를 만족하는 첫 k를 찾음
+            # 우리가 원하는 s는 cdf[s] <= cum_freq < cdf[s+1]
+            # 따라서 s = k - 1
+            
+            # C++이 cdf_end까지만 탐색하므로, Python도 슬라이싱
+            cdf_view = cdf[:cdf_size] 
+            s = bisect.bisect_right(cdf_view, cum_freq) - 1
+            
+            # Rans64DecAdvance(&_rans, &_ptr, cdf[s], cdf[s + 1] - cdf[s], precision);
+            self._rans_state, self._ptr_idx = Rans64.dec_advance(
+                self._rans_state, self._ptr_idx,
+                cdf[s], cdf[s + 1] - cdf[s], Rans64.PRECISION,
+                self._stream_words
+            )
+
+            value = s
+
+            if value == max_value:
+                # Bypass decoding mode
+                
+                # Decode number of bypasses
+                val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
+                    self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
+                )
+                n_bypass = val
+                
+                while val == Rans64.MAX_BYPASS_VAL:
+                    val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
+                        self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
+                    )
+                    n_bypass += val
+
+                # Decode raw value
+                raw_val = 0
+                for j in range(n_bypass):
+                    val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
+                        self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
+                    )
+                    raw_val |= (val << (j * Rans64.BYPASS_PRECISION))
+                
+                # Reconstruct value from raw_val (인코더 로직의 역)
+                if (raw_val & 1): # 음수였음
+                    value = -(raw_val >> 1) - 1
+                else: # 양수(max_value 이상)였음
+                    value = (raw_val >> 1) + max_value
+
+            # C++: outout_ptr[i] = static_cast<int16_t>(value + offset);
+            # Python은 int16_t 캐스팅이 필요 없지만, 값의 범위가 그렇다는 의미.
+            output[i] = value + offset
+            
+        return output
+
