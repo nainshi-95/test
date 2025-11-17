@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import List, Deque, Optional, Tuple, Sequence
 
 # ----------------------------------------------------------------------------
-# [이전 답변] 1. pmf_to_quantized_cdf 함수
+# 1. pmf_to_quantized_cdf 함수
 # ----------------------------------------------------------------------------
 
 def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
@@ -20,7 +20,6 @@ def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
 
     for i, p in enumerate(pmf):
         scaled_p = p * scale
-        # C++의 std::round(x) 동작(양수 x에 대해 floor(x + 0.5)) 모방
         cdf[i + 1] = int(math.floor(scaled_p + 0.5))
 
     total = sum(cdf)
@@ -67,7 +66,7 @@ def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
     return cdf
 
 # ----------------------------------------------------------------------------
-# [이전 답변] 2. Rans64 헬퍼 및 자료구조
+# 2. Rans64 헬퍼 및 자료구조
 # ----------------------------------------------------------------------------
 
 class Rans64:
@@ -143,10 +142,8 @@ class RansSymbol:
     range: int
     bypass: bool
 
-# (RansEncoderLibMultiThread 및 관련 클래스는 테스트에 불필요하므로 생략)
-
 # ----------------------------------------------------------------------------
-# [이전 답변] 3. RansEncoderLib
+# 3. RansEncoderLib (수정됨)
 # ----------------------------------------------------------------------------
 
 class RansEncoderLib:
@@ -166,7 +163,9 @@ class RansEncoderLib:
         symbols: List[int], indexes: List[int], cdfs: List[List[int]],
         cdfs_sizes: List[int], offsets: List[int]
     ):
-        for i in range(len(symbols) - 1, -1, -1):
+        # [수정됨] C++ 원본 코드는 주석(backward)과 달리 '정방향' 루프입니다.
+        for i in range(len(symbols)): # <- 수정된 부분 (정방향 루프)
+            
             cdf_idx = indexes[i]
             if cdf_idx < 0: continue
             
@@ -230,7 +229,7 @@ class RansEncoderLib:
         self._stream = bytes(buffer)
 
 # ----------------------------------------------------------------------------
-# [이전 답변] 4. RansDecoderLib
+# 4. RansDecoderLib
 # ----------------------------------------------------------------------------
 
 class RansDecoderLib:
@@ -245,7 +244,6 @@ class RansDecoderLib:
         self._stream_words = []
         for i in range(0, len(encoded), 4):
             word_bytes = encoded[i:i+4]
-            # C++ 코드는 32비트 정렬을 가정하므로 패딩된 바이트는 무시
             if len(word_bytes) == 4:
                 self._stream_words.append(
                     int.from_bytes(word_bytes, 'little', signed=False)
@@ -324,18 +322,9 @@ if __name__ == "__main__":
 
     # --- 1. 테스트 데이터 준비 ---
     
-    # [0, 1, 2] 심볼에 대한 확률 (총 합은 1이 아니어도 됨)
     pmf = [0.2, 0.5, 0.3] 
     
-    # 바이패스 모드 테스트 포함:
-    # (offset = 0 기준)
-    # max_value = len(pmf) - 1 = 2
-    # [0, 1]: 정상 인코딩
-    # [2]: 정상 인코딩 (sentinel, raw_val=0, n_bypass=0)
-    # [3]: 바이패스 (value=3 >= 2 -> raw_val=2)
-    # [-1]: 바이패스 (value=-1 < 0 -> raw_val=1)
-    # [-10]: 바이패스 (value=-10 < 0 -> raw_val=19)
-    # [10]: 바이패스 (value=10 >= 2 -> raw_val=16)
+    # 바이패스 모드 테스트 포함: [0, 1, 2, 3(Bypass), -1(Bypass), -10(Bypass), 10(Bypass)]
     test_symbols = [0, 1, 2, 1, 0, 3, 1, 2, -1, 0, -10, 10, 1]
     
     print(f"원본 심볼: {test_symbols}")
