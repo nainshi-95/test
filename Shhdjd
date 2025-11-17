@@ -1,0 +1,117 @@
+import math
+from typing import List
+
+def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
+    """
+    주어진 C++ 코드를 Python으로 동일하게 구현한 함수입니다.
+    PMF(확률 질량 함수)를 양자화된 CDF(누적 분포 함수)로 변환합니다.
+
+    C++의 std::round(x)는 .5를 0에서 멀어지게 반올림 (예: 2.5 -> 3.0) 하는 반면,
+    Python의 round(x)는 .5를 가장 가까운 짝수로 반올림 (예: 2.5 -> 2) 합니다.
+    따라서 C++의 동작(양수 기준)을 모방하기 위해 int(math.floor(x + 0.5))를 사용합니다.
+    """
+
+    # C++: std::vector<uint32_t> cdf(pmf.size() + 1);
+    # C++: cdf[0] = 0;
+    cdf = [0] * (len(pmf) + 1)
+    
+    scale = 1 << precision
+
+    # C++: std::transform(pmf.begin(), pmf.end(), cdf.begin() + 1, ... )
+    #
+    # C++ 코드의 람다:
+    # return static_cast<uint32_t>(std::round(p * (1 << precision)) + 0.5);
+    #
+    # 여기서 std::round() 이후의 + 0.5는 float -> uint32_t 캐스팅 시
+    # 어차피 버려지므로 실제 동작에 영향을 주지 않습니다.
+    # (예: std::round(2.5) -> 3.0. 3.0 + 0.5 -> 3.5. (uint32_t)3.5 -> 3)
+    # (예: std::round(2.4) -> 2.0. 2.0 + 0.5 -> 2.5. (uint32_t)2.5 -> 2)
+    #
+    # 따라서 C++의 std::round(x) 동작(양수 x에 대해 floor(x + 0.5))만 구현하면 됩니다.
+    for i, p in enumerate(pmf):
+        scaled_p = p * scale
+        cdf[i + 1] = int(math.floor(scaled_p + 0.5))
+
+    # C++: const uint32_t total = std::accumulate(cdf.begin(), cdf.end(), 0);
+    total = sum(cdf)
+
+    # 0으로 나누는 것을 방지 (모든 pmf가 0인 엣지 케이스)
+    if total == 0:
+        total = 1
+
+    # C++: std::transform(cdf.begin(), cdf.end(), cdf.begin(), [precision, total](uint32_t p) {
+    #       return static_cast<uint32_t>((((1ull << precision) * p) / total));
+    #    });
+    # C++의 정수 나눗셈은 버림(truncation)입니다 (Python의 // 와 동일)
+    for i in range(len(cdf)):
+        # (1ull << precision)은 C++에서 64비트 연산을 위한 것이며,
+        # Python은 임의 정밀도 정수를 지원하므로 (scale * cdf[i])가 오버플로되지 않습니다.
+        cdf[i] = (scale * cdf[i]) // total
+
+    # C++: std::partial_sum(cdf.begin(), cdf.end(), cdf.begin());
+    # (in-place 누적 합)
+    current_sum = 0
+    for i in range(len(cdf)):
+        current_sum += cdf[i]
+        cdf[i] = current_sum
+
+    # C++: cdf.back() = 1 << precision;
+    cdf[-1] = scale
+
+    # C++: for (int i = 0; i < static_cast<int>(cdf.size() - 1); ++i) {
+    # 0의 빈도를 가진 심볼(cdf[i] == cdf[i+1])을 찾아 수정합니다.
+    n = len(cdf) - 1
+    for i in range(n):
+        if cdf[i] == cdf[i + 1]:
+            # "Try to steal frequency from low-frequency symbols"
+            
+            # C++: uint32_t best_freq = ~0u;
+            best_freq = (1 << 32) - 1  # ~0u (unsigned 32-bit max)
+            best_steal = -1
+            
+            # C++: for (int j = 0; j < static_cast<int>(cdf.size()) - 1; ++j) {
+            for j in range(n):
+                freq = cdf[j + 1] - cdf[j]
+                if freq > 1 and freq < best_freq:
+                    best_freq = freq
+                    best_steal = j
+
+            # C++: assert(best_steal != -1);
+            assert best_steal != -1, "Cannot find a symbol to steal frequency from"
+
+            # C++: if (best_steal < i) { ... } else { ... }
+            if best_steal < i:
+                for j in range(best_steal + 1, i + 1):
+                    cdf[j] -= 1
+            else:
+                # C++: assert(best_steal > i);
+                assert best_steal > i, "best_steal == i, which should not happen"
+                for j in range(i + 1, best_steal + 1):
+                    cdf[j] += 1
+
+    # C++: Asserts
+    assert cdf[0] == 0
+    assert cdf[-1] == scale
+    for i in range(n):
+        assert cdf[i + 1] > cdf[i], f"CDF not strictly increasing at index {i}"
+
+    return cdf
+
+# --- 예제 사용법 ---
+if __name__ == "__main__":
+    # 간단한 PMF 예제 (합이 1이 아니어도 정규화되므로 괜찮음)
+    # pmf = [0.1, 0.2, 0.6, 0.1]
+    pmf = [0.1, 0.0001, 0.2, 0.0001, 0.6, 0.1] # 0에 가까운 값 포함
+    precision = 10
+
+    quantized_cdf = pmf_to_quantized_cdf(pmf, precision)
+
+    print(f"PMF: {pmf}")
+    print(f"Precision: {precision}")
+    print(f"Quantized CDF: {quantized_cdf}")
+    print(f"CDF Length: {len(quantized_cdf)} (should be len(pmf) + 1 = {len(pmf) + 1})")
+    
+    # 빈도(frequency) 계산 (디버깅용)
+    freqs = [quantized_cdf[i+1] - quantized_cdf[i] for i in range(len(pmf))]
+    print(f"Frequencies: {freqs}")
+    print(f"Total Frequency: {sum(freqs)} (should be {1 << precision})")
