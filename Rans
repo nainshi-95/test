@@ -170,6 +170,147 @@ class RansEncoderDecoder:
         return decoded_indices
 
 
+
+
+
+
+
+
+def pmf_to_cdf(pmf: list[list[float]], 
+               tail_mass: list[list[float]], 
+               pmf_length: list[int], 
+               max_length: int, 
+               precision_bits: int = 16) -> list[list[int]]:
+    """
+    부동소수점 PMF를 양자화된 정수 CDF(CMF) 테이블로 변환합니다.
+    (Pure Python, no PyTorch/NumPy)
+
+    Args:
+        pmf (list[list[float]]): [num_scales, max_length] 형태의 PMF 값.
+        tail_mass (list[list[float]]): [num_scales, 1] 형태의 테일 확률.
+        pmf_length (list[int]): [num_scales] 각 스케일별 실제 PMF 길이.
+        max_length (int): pmf_length 중 최대값.
+        precision_bits (int): CDF 테이블의 정밀도. (총합 M = 1 << precision_bits)
+
+    Returns:
+        list[list[int]]: [num_scales, max_length + 2] 형태의 양자화된 CDF 테이블.
+    """
+    
+    M = 1 << precision_bits
+    num_scales = len(pmf_length)
+    output_cdf_tables = []
+    
+    # 부동소수점 정밀도 문제를 피하기 위한 작은 값
+    EPSILON = 1e-9 
+
+    for i in range(num_scales):
+        L = pmf_length[i] # 이 스케일(row)의 실제 심볼 개수
+        
+        # 1. 이 스케일(row)의 모든 확률을 수집합니다. (총 L+1개 심볼)
+        #    - p_central: [심볼 0, 심볼 1, ..., 심볼 L-1]
+        #    - all_probs: [테일 심볼, 심볼 0, ..., 심볼 L-1]
+        p_tail = tail_mass[i][0]
+        p_central = [pmf[i][j] for j in range(L)]
+        all_probs = [p_tail] + p_central
+        
+        N = len(all_probs)  # N = L + 1
+        
+        freq_int = [0] * N
+        
+        # 2. 0이 아닌 확률을 가진 심볼의 인덱스를 찾습니다.
+        non_zero_indices = [j for j, p in enumerate(all_probs) if p > EPSILON]
+
+        # 만약 모든 확률이 0이라면 (매우 드문 경우)
+        if not non_zero_indices:
+            # [0, M, M, M, ...] 형태의 더미 CDF 생성
+            cdf_row = [0] + [M] * (max_length + 1)
+            output_cdf_tables.append(cdf_row)
+            continue
+
+        # 3. 양자화(Quantization)
+        
+        # 3a. 0이 아닌 모든 심볼에 최소 빈도 1을 할당합니다.
+        M_allocated = 0
+        for j in non_zero_indices:
+            freq_int[j] = 1
+            M_allocated += 1
+            
+        M_remaining = M - M_allocated
+        
+        # 3b. 남은 빈도(M_remaining)를 확률에 비례하여 분배합니다.
+        if M_remaining > 0:
+            # 1을 할당한 심볼들의 확률 총합
+            sum_p_for_distrib = sum(all_probs[j] for j in non_zero_indices)
+            
+            if sum_p_for_distrib <= EPSILON:
+                # 합이 0인데 non_zero_indices가 있다면, 
+                # (e.g., 매우 작은 값 하나만 있음)
+                # 남은 M을 그냥 첫 번째 심볼에 모두 할당합니다.
+                freq_int[non_zero_indices[0]] += M_remaining
+            else:
+                # 남은 M을 확률에 비례하여 분배
+                scale_factor = 1.0 / sum_p_for_distrib
+                norm_probs = [all_probs[j] * scale_factor for j in non_zero_indices]
+                
+                # M_remaining을 비례 배분한 값 (float)
+                freq_float_add = [p * M_remaining for p in norm_probs]
+                # M_remaining을 비례 배분한 값 (int)
+                freq_int_add = [int(f) for f in freq_float_add]
+                
+                sum_freq_int_add = sum(freq_int_add)
+                
+                # 3c. 반올림 오차로 인해 분배되지 못한 '자투리'를 분배합니다.
+                remaining_add = M_remaining - sum_freq_int_add
+                
+                if remaining_add > 0:
+                    # 소수점 손실이 가장 컸던 심볼 순서대로 정렬
+                    fracs = [(f - i, idx_in_nz_list) 
+                             for idx_in_nz_list, (f, i) in enumerate(zip(freq_float_add, freq_int_add))]
+                    fracs.sort(key=lambda x: x[0], reverse=True)
+                    
+                    # 자투리(remaining_add)를 상위 N개에 1씩 더해줌
+                    for k in range(min(remaining_add, len(fracs))):
+                        freq_int_add[fracs[k][1]] += 1
+
+                # 3d. 기본값 1에 추가 분배된 빈도를 더합니다.
+                for idx_in_nz_list, f_add in enumerate(freq_int_add):
+                    original_index = non_zero_indices[idx_in_nz_list]
+                    freq_int[original_index] += f_add
+
+        # 4. 최종 빈도(freq_int)를 CDF로 변환합니다.
+        #    - cdf_row는 [max_length + 2] 크기를 가져야 합니다.
+        cdf_row = [0] * (max_length + 2)
+        
+        current_sum = 0
+        # N = L + 1 개의 심볼에 대해 CDF 계산
+        for j in range(N): 
+            current_sum += freq_int[j]
+            cdf_row[j+1] = current_sum
+
+        # 5. 사용되지 않는 나머지 CDF 슬롯을 M으로 채웁니다.
+        #    (이 심볼이 나올 확률(빈도)이 0이 되도록 cdf[k+1] - cdf[k] = 0)
+        for j in range(N + 1, max_length + 2):
+            cdf_row[j] = M
+            
+        # 6. (안전장치) 부동소수점 오차로 M이 아닐 경우 강제로 M으로 설정
+        if cdf_row[N] != M and N > 0:
+            # print(f"Warning: Row {i} sum was {cdf_row[N]}, forcing to {M}")
+            cdf_row[N] = M
+            # N 뒤의 모든 값도 M으로 강제
+            for j in range(N + 1, max_length + 2):
+                cdf_row[j] = M
+
+        output_cdf_tables.append(cdf_row)
+
+    return output_cdf_tables
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
     # 1. 설정
     PRECISION = 10
