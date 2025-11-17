@@ -1,308 +1,363 @@
 import bisect
-import struct  # 32비트 정수 <-> bytes 변환을 위해 추가
+from typing import List, Sequence
 
-class RansEncoderDecoder:
+class ArithmeticEncoder:
     """
-    rANS(range Asymmetric Numeral Systems)를 사용하여
-    심볼 시퀀스를 인코딩 및 디코딩하는 클래스. (바이너리 파일 I/O 지원)
+    정수 기반 산술 부호화(Integer Arithmetic Coding) 인코더입니다.
+    
+    CMF(Cumulative Mass Function) 테이블과 심볼 인덱스를 받아
+    비트스트림으로 압축합니다.
     """
-
-    def __init__(self, precision_bits=20):
-        if not 16 <= precision_bits <= 30:
-            print(f"Warning: {precision_bits}bit 정밀도는 비효율적이거나 "
-                  "Python 정수 한계를 벗어날 수 있습니다. (권장: 20-30)")
+    
+    def __init__(self, precision_bits: int = 48):
+        """
+        인코더를 초기화합니다.
+        
+        Args:
+            precision_bits (int): 연산에 사용할 정밀도 비트 수. 
+                                 클수록 압축률이 미세하게 향상되지만 
+                                 Python의 큰 정수 연산에 의존합니다.
+        """
+        if not 16 <= precision_bits <= 62:
+            raise ValueError("정밀도는 16비트에서 62비트 사이여야 합니다.")
 
         self.precision_bits = precision_bits
-        self.M = 1 << self.precision_bits  # 확률의 총합 (분모)
+        self.max_val = (1 << self.precision_bits) - 1
+        self.half_val = (self.max_val >> 1) + 1
+        self.quarter1_val = (self.max_val >> 2) + 1
+        self.quarter3_val = self.quarter1_val * 3
 
-        self.CHUNK_BITS = 32
-        self.CHUNK_BYTES = self.CHUNK_BITS // 8  # 4 바이트
-        self.LOWER_BOUND = 1 << self.CHUNK_BITS
+        # 인코딩 상태 변수
+        self.low = 0
+        self.range = self.max_val
+        self._pending_bits = 0
 
-        # 64비트(청크 2개)로 상태를 저장
-        self.STATE_CHUNKS = 2
+        # 비트스트림 출력 버퍼
+        self._output_bytes = bytearray()
+        self._bit_buffer = 0
+        self._bit_count = 0
 
-        # 내부 상태 변수
-        self.encode_state = self.M
-        self.encode_bitstream = []  # list[int]
-        
-        self.decode_state = 0
-        self.decode_bitstream = []  # list[int]
+    def _write_bit(self, bit: int):
+        """단일 비트를 내부 버퍼에 씁니다."""
+        self._bit_buffer = (self._bit_buffer << 1) | bit
+        self._bit_count += 1
+        if self._bit_count == 8:
+            self._output_bytes.append(self._bit_buffer)
+            self._bit_buffer = 0
+            self._bit_count = 0
 
-    def encode(self, cmf_tables, indices):
-        """ (이전과 동일) """
-        
-        if len(cmf_tables) != len(indices):
-            raise ValueError("CMF 테이블 리스트와 인덱스 리스트의 길이가 다릅니다.")
+    def _write_pending_bits(self, bit: int):
+        """현재 비트와 보류 중이던 비트들을 출력합니다."""
+        self._write_bit(bit)
+        for _ in range(self._pending_bits):
+            self._write_bit(1 - bit)
+        self._pending_bits = 0
 
-        # LIFO: 리스트의 역순으로 인코딩
-        for cmf, index in reversed(list(zip(cmf_tables, indices))):
-            if not (0 <= index < len(cmf) - 1):
-                raise ValueError(f"인덱스 {index}가 CMF 테이블(길이: {len(cmf)}) 범위를 벗어났습니다.")
-            
-            c = cmf[index]
-            f = cmf[index+1] - c  # f = 빈도수(frequency)
+    def _renormalize_encode(self):
+        """인코딩 후 [low, high) 범위를 정규화합니다."""
+        while True:
+            if (self.low + self.range) <= self.half_val:  # [0, 0.5) 범위
+                self._write_pending_bits(0)
+                self.low <<= 1
+                self.range <<= 1
+            elif self.low >= self.half_val:  # [0.5, 1) 범위
+                self._write_pending_bits(1)
+                self.low = (self.low - self.half_val) << 1
+                self.range <<= 1
+            elif (self.low >= self.quarter1_val and
+                  (self.low + self.range) <= self.quarter3_val):  # [0.25, 0.75) 범위 (Underflow)
+                self._pending_bits += 1
+                self.low = (self.low - self.quarter1_val) << 1
+                self.range <<= 1
+            else:
+                break  # 정규화 불필요
 
-            if f == 0:
-                raise ValueError(f"인덱스 {index}의 빈도수(f)가 0입니다. CMF 테이블 오류.")
-            if cmf[-1] != self.M:
-                raise ValueError(f"CMF 테이블이 정규화되지 않았습니다. "
-                                 f"cmf[-1] ({cmf[-1]}) != M ({self.M})")
+    def encode(self, cmf_table: Sequence[int], index: int):
+        """
+        단일 심볼을 인코딩합니다.
 
-            # 1. 정규화 (Renormalization)
-            while self.encode_state >= (f << self.CHUNK_BITS):
-                self.encode_bitstream.append(self.encode_state & ((1 << self.CHUNK_BITS) - 1))
-                self.encode_state >>= self.CHUNK_BITS
+        Args:
+            cmf_table (Sequence[int]): 현재 심볼의 CMF 테이블. (예: [0, 10, 15, 20])
+            index (int): 인코딩할 심볼의 인덱스.
+        """
+        total = cmf_table[-1]
+        if total == 0:
+            raise ValueError("CMF 테이블의 총합(total)은 0이 될 수 없습니다.")
+        if index < 0 or (index + 1) >= len(cmf_table):
+            raise IndexError("유효하지 않은 CMF 테이블 인덱스입니다.")
 
-            # 2. 인코딩 (상태 업데이트)
-            self.encode_state = (self.encode_state // f) * self.M + (self.encode_state % f) + c
+        r_start = cmf_table[index]
+        r_end = cmf_table[index + 1]
+        r_count = r_end - r_start
+
+        if r_count == 0:
+            # 확률이 0인 심볼은 인코딩할 수 없습니다.
+            # (실제로는 이런 경우가 드물지만, 안전을 위해)
+            raise ValueError(f"심볼 {index}의 확률이 0입니다 (CMF: {r_start} -> {r_end}).")
+
+        # 범위를 갱신합니다.
+        self.range = self.range // total
+        self.low = self.low + r_start * self.range
+        self.range = r_count * self.range
+
+        # 범위를 정규화하여 비트를 출력합니다.
+        self._renormalize_encode()
 
     def flush(self) -> bytes:
-        """ (이전과 동일) """
-        
-        # 32비트 정수 청크 리스트를 생성
-        final_stream_chunks = list(self.encode_bitstream)
-        
-        state = self.encode_state
-        
-        # LIFO: 최종 상태(state)를 64비트(청크 2개)로 리스트 *끝*에 추가
-        # [..., state_low, state_high] 순서로 저장됨
-        for _ in range(self.STATE_CHUNKS):
-            final_stream_chunks.append(state & ((1 << self.CHUNK_BITS) - 1))
-            state >>= self.CHUNK_BITS
-
-        if state != 0:
-             print(f"Warning: 인코더 상태가 {self.STATE_CHUNKS}개 청크(64비트)를 초과했습니다.")
-
-        # [수정] list[int] -> bytes 변환
-        try:
-            # '<' : 리틀 엔디안
-            # 'I' : 32비트 부호 없는 정수 (unsigned int)
-            num_chunks = len(final_stream_chunks)
-            packed_bytes = struct.pack(f'<{num_chunks}I', *final_stream_chunks)
-        except struct.error as e:
-            raise IOError(f"비트스트림 패킹 실패: {e}")
-
-        # 인코더 상태 리셋
-        self.encode_state = self.M
-        self.encode_bitstream = []
-
-        return packed_bytes
-
-    def set_bitstream(self, bitstream_bytes: bytes):
         """
-        디코딩을 위해 'bytes' 비트스트림을 설정합니다. (버그 수정됨)
+        인코딩을 종료하고 최종 비트스트림을 반환합니다.
+        모든 심볼을 인코딩한 후 **반드시 한 번** 호출해야 합니다.
+
+        Returns:
+            bytes: 압축된 비트스트림.
         """
-        if not bitstream_bytes or len(bitstream_bytes) % self.CHUNK_BYTES != 0:
-            raise ValueError(f"비트스트림 크기가 {self.CHUNK_BYTES}바이트 배수가 아닙니다 (데이터 손상 가능성).")
+        # 마지막으로 보류된 비트들을 처리합니다.
+        self._pending_bits += 1
+        if self.low < self.quarter1_val:
+            self._write_pending_bits(0)
+        else:
+            self._write_pending_bits(1)
 
-        num_chunks = len(bitstream_bytes) // self.CHUNK_BYTES
-        
-        if num_chunks < self.STATE_CHUNKS:
-             raise ValueError("비트스트림이 상태(state) 정보를 읽기에 너무 짧습니다.")
+        # 비트 버퍼에 남아있는 비트들을 0으로 패딩하여 추가합니다.
+        if self._bit_count > 0:
+            self._bit_buffer <<= (8 - self._bit_count)
+            self._output_bytes.append(self._bit_buffer)
             
-        try:
-            unpacked_tuple = struct.unpack(f'<{num_chunks}I', bitstream_bytes)
-            self.decode_bitstream = list(unpacked_tuple) 
-        except struct.error as e:
-            raise IOError(f"비트스트림 언패킹 실패: {e}")
-
-        # --- [버그 수정 지점] ---
-        # LIFO: 비트스트림의 *끝*에서 상태(state)를 읽어옵니다.
-        # flush가 [..., state_low, state_high]로 썼으므로,
-        # pop()은 state_high, state_low 순서로 나옵니다.
-        state = 0
+        # 상태 초기화 (재사용 대비)
+        final_bitstream = bytes(self._output_bytes)
         
-        # state = (state_high << 32) | (state_low << 0) 가 되어야 합니다.
-        
-        # i=0일 때 pop() -> state_high
-        # i=1일 때 pop() -> state_low
-        for i in range(self.STATE_CHUNKS):
-            chunk = self.decode_bitstream.pop() 
-            # i=0일 때 state_high -> 32비트 시프트
-            # i=1일 때 state_low  -> 0비트 시프트
-            shift = (self.STATE_CHUNKS - 1 - i) * self.CHUNK_BITS 
-            state |= (chunk << shift)
-            
-        self.decode_state = state
-        # --- [수정 완료] ---
+        self.low = 0
+        self.range = self.max_val
+        self._pending_bits = 0
+        self._output_bytes = bytearray()
+        self._bit_buffer = 0
+        self._bit_count = 0
 
+        return final_bitstream
 
-    def decode(self, cmf_tables):
-        """ (이전과 동일) """
-        
-        state = self.decode_state
-        chunks = self.decode_bitstream
-        decoded_indices = []
+# ---------------------------------------------------------------------------
 
-        # FIFO: CMF 테이블 리스트의 정순으로 디코딩
-        for cmf in cmf_tables:
-            if cmf[-1] != self.M:
-                raise ValueError(f"CMF 테이블이 정규화되지 않았습니다. "
-                                 f"cmf[-1] ({cmf[-1]}) != M ({self.M})")
-                                 
-            # 1. 심볼 찾기 (state % M)
-            slot = state & (self.M - 1)
-
-            # 이진 탐색으로 'index'를 찾음: cmf[index] <= slot < cmf[index+1]
-            index = bisect.bisect_right(cmf, slot) - 1
-
-            if not (0 <= index < len(cmf) - 1):
-                # (디버깅) 만약 여기서 에러가 난다면 state가 잘못 복원된 것입니다.
-                raise ValueError(f"디코딩 실패: slot {slot} (state: {state})이 CMF 범위에 없습니다.")
-
-            decoded_indices.append(index)
-
-            c = cmf[index]
-            f = cmf[index+1] - c  # f = 빈도수(frequency)
-
-            # 2. 디코딩 (상태 업데이트)
-            state = f * (state >> self.precision_bits) + slot - c
-
-            # 3. 정규화 (Renormalization)
-            while state < self.LOWER_BOUND and chunks:
-                bits = chunks.pop()
-                state = (state << self.CHUNK_BITS) | bits
-        
-        self.decode_state = state
-        self.decode_bitstream = chunks
-
-        return decoded_indices
-
-
-
-
-
-
-
-
-def pmf_to_cdf(pmf: list[list[float]], 
-               tail_mass: list[list[float]], 
-               pmf_length: list[int], 
-               max_length: int, 
-               precision_bits: int = 16) -> list[list[int]]:
+class ArithmeticDecoder:
     """
-    부동소수점 PMF를 양자화된 정수 CDF(CMF) 테이블로 변환합니다.
-    (Pure Python, no PyTorch/NumPy)
-
-    Args:
-        pmf (list[list[float]]): [num_scales, max_length] 형태의 PMF 값.
-        tail_mass (list[list[float]]): [num_scales, 1] 형태의 테일 확률.
-        pmf_length (list[int]): [num_scales] 각 스케일별 실제 PMF 길이.
-        max_length (int): pmf_length 중 최대값.
-        precision_bits (int): CDF 테이블의 정밀도. (총합 M = 1 << precision_bits)
-
-    Returns:
-        list[list[int]]: [num_scales, max_length + 2] 형태의 양자화된 CDF 테이블.
+    정수 기반 산술 부호화(Integer Arithmetic Coding) 디코더입니다.
+    
+    비트스트림과 CMF 테이블을 받아 심볼 인덱스를 복원합니다.
     """
-    
-    M = 1 << precision_bits
-    num_scales = len(pmf_length)
-    output_cdf_tables = []
-    
-    # 부동소수점 정밀도 문제를 피하기 위한 작은 값
-    EPSILON = 1e-9 
 
-    for i in range(num_scales):
-        L = pmf_length[i] # 이 스케일(row)의 실제 심볼 개수
+    def __init__(self, precision_bits: int = 48):
+        """
+        디코더를 초기화합니다.
         
-        # 1. 이 스케일(row)의 모든 확률을 수집합니다. (총 L+1개 심볼)
-        #    - p_central: [심볼 0, 심볼 1, ..., 심볼 L-1]
-        #    - all_probs: [테일 심볼, 심볼 0, ..., 심볼 L-1]
-        p_tail = tail_mass[i][0]
-        p_central = [pmf[i][j] for j in range(L)]
-        all_probs = [p_tail] + p_central
-        
-        N = len(all_probs)  # N = L + 1
-        
-        freq_int = [0] * N
-        
-        # 2. 0이 아닌 확률을 가진 심볼의 인덱스를 찾습니다.
-        non_zero_indices = [j for j, p in enumerate(all_probs) if p > EPSILON]
+        Args:
+            precision_bits (int): 인코더와 **반드시 동일한** 정밀도 비트 수.
+        """
+        if not 16 <= precision_bits <= 62:
+            raise ValueError("정밀도는 16비트에서 62비트 사이여야 합니다.")
 
-        # 만약 모든 확률이 0이라면 (매우 드문 경우)
-        if not non_zero_indices:
-            # [0, M, M, M, ...] 형태의 더미 CDF 생성
-            cdf_row = [0] + [M] * (max_length + 1)
-            output_cdf_tables.append(cdf_row)
-            continue
+        self.precision_bits = precision_bits
+        self.max_val = (1 << self.precision_bits) - 1
+        self.half_val = (self.max_val >> 1) + 1
+        self.quarter1_val = (self.max_val >> 2) + 1
+        self.quarter3_val = self.quarter1_val * 3
 
-        # 3. 양자화(Quantization)
-        
-        # 3a. 0이 아닌 모든 심볼에 최소 빈도 1을 할당합니다.
-        M_allocated = 0
-        for j in non_zero_indices:
-            freq_int[j] = 1
-            M_allocated += 1
-            
-        M_remaining = M - M_allocated
-        
-        # 3b. 남은 빈도(M_remaining)를 확률에 비례하여 분배합니다.
-        if M_remaining > 0:
-            # 1을 할당한 심볼들의 확률 총합
-            sum_p_for_distrib = sum(all_probs[j] for j in non_zero_indices)
-            
-            if sum_p_for_distrib <= EPSILON:
-                # 합이 0인데 non_zero_indices가 있다면, 
-                # (e.g., 매우 작은 값 하나만 있음)
-                # 남은 M을 그냥 첫 번째 심볼에 모두 할당합니다.
-                freq_int[non_zero_indices[0]] += M_remaining
+        # 디코딩 상태 변수
+        self.low = 0
+        self.range = self.max_val
+        self.value = 0  # 비트스트림에서 읽어온 값
+
+        # 비트스트림 입력 버퍼
+        self._bitstream = b""
+        self._byte_index = 0
+        self._bit_count = 0  # 현재 바이트에서 *남은* 비트 수
+        self._current_byte = 0
+
+    def _read_bit(self) -> int:
+        """비트스트림에서 단일 비트를 읽어옵니다."""
+        if self._bit_count == 0:
+            if self._byte_index < len(self._bitstream):
+                self._current_byte = self._bitstream[self._byte_index]
+                self._byte_index += 1
             else:
-                # 남은 M을 확률에 비례하여 분배
-                scale_factor = 1.0 / sum_p_for_distrib
-                norm_probs = [all_probs[j] * scale_factor for j in non_zero_indices]
-                
-                # M_remaining을 비례 배분한 값 (float)
-                freq_float_add = [p * M_remaining for p in norm_probs]
-                # M_remaining을 비례 배분한 값 (int)
-                freq_int_add = [int(f) for f in freq_float_add]
-                
-                sum_freq_int_add = sum(freq_int_add)
-                
-                # 3c. 반올림 오차로 인해 분배되지 못한 '자투리'를 분배합니다.
-                remaining_add = M_remaining - sum_freq_int_add
-                
-                if remaining_add > 0:
-                    # 소수점 손실이 가장 컸던 심볼 순서대로 정렬
-                    fracs = [(f - i, idx_in_nz_list) 
-                             for idx_in_nz_list, (f, i) in enumerate(zip(freq_float_add, freq_int_add))]
-                    fracs.sort(key=lambda x: x[0], reverse=True)
-                    
-                    # 자투리(remaining_add)를 상위 N개에 1씩 더해줌
-                    for k in range(min(remaining_add, len(fracs))):
-                        freq_int_add[fracs[k][1]] += 1
-
-                # 3d. 기본값 1에 추가 분배된 빈도를 더합니다.
-                for idx_in_nz_list, f_add in enumerate(freq_int_add):
-                    original_index = non_zero_indices[idx_in_nz_list]
-                    freq_int[original_index] += f_add
-
-        # 4. 최종 빈도(freq_int)를 CDF로 변환합니다.
-        #    - cdf_row는 [max_length + 2] 크기를 가져야 합니다.
-        cdf_row = [0] * (max_length + 2)
+                self._current_byte = 0  # 스트림 끝, 패딩된 0을 읽음
+            self._bit_count = 8
         
-        current_sum = 0
-        # N = L + 1 개의 심볼에 대해 CDF 계산
-        for j in range(N): 
-            current_sum += freq_int[j]
-            cdf_row[j+1] = current_sum
+        bit = (self._current_byte >> 7) & 1
+        self._current_byte = (self._current_byte << 1) & 0xFF
+        self._bit_count -= 1
+        return bit
 
-        # 5. 사용되지 않는 나머지 CDF 슬롯을 M으로 채웁니다.
-        #    (이 심볼이 나올 확률(빈도)이 0이 되도록 cdf[k+1] - cdf[k] = 0)
-        for j in range(N + 1, max_length + 2):
-            cdf_row[j] = M
+    def set_bitstream(self, bitstream: bytes):
+        """
+        디코딩할 비트스트림을 설정합니다.
+        디코딩 시작 전 **반드시 한 번** 호출해야 합니다.
+
+        Args:
+            bitstream (bytes): 인코더가 출력한 비트스트림.
+        """
+        if not bitstream:
+            raise ValueError("비트스트림이 비어있습니다.")
             
-        # 6. (안전장치) 부동소수점 오차로 M이 아닐 경우 강제로 M으로 설정
-        if cdf_row[N] != M and N > 0:
-            # print(f"Warning: Row {i} sum was {cdf_row[N]}, forcing to {M}")
-            cdf_row[N] = M
-            # N 뒤의 모든 값도 M으로 강제
-            for j in range(N + 1, max_length + 2):
-                cdf_row[j] = M
+        self._bitstream = bitstream
+        self._byte_index = 0
+        self._bit_count = 0
+        self._current_byte = 0
 
-        output_cdf_tables.append(cdf_row)
+        # 상태 초기화
+        self.low = 0
+        self.range = self.max_val
+        self.value = 0
 
-    return output_cdf_tables
+        # 초기 `precision_bits` 만큼 비트를 읽어 `self.value`를 채웁니다.
+        for _ in range(self.precision_bits):
+            self.value = (self.value << 1) | self._read_bit()
+
+    def _renormalize_decode(self):
+        """디코딩 후 [low, high) 범위를 정규화합니다."""
+        while True:
+            if (self.low + self.range) <= self.half_val:
+                pass  # [0, 0.5) 범위
+            elif self.low >= self.half_val:
+                self.low -= self.half_val
+                self.value -= self.half_val
+            elif (self.low >= self.quarter1_val and
+                  (self.low + self.range) <= self.quarter3_val):
+                self.low -= self.quarter1_val
+                self.value -= self.quarter1_val
+            else:
+                break  # 정규화 불필요
+
+            self.low <<= 1
+            self.range <<= 1
+            self.value = (self.value << 1) | self._read_bit()
+
+    def decode(self, cmf_table: Sequence[int]) -> int:
+        """
+        비트스트림에서 다음 심볼을 디코딩합니다.
+
+        Args:
+            cmf_table (Sequence[int]): 현재 심볼의 CMF 테이블 (인코딩 시 사용한 것과 동일해야 함).
+
+        Returns:
+            int: 복원된 심볼의 인덱스.
+        """
+        total = cmf_table[-1]
+        if total == 0:
+            raise ValueError("CMF 테이블의 총합(total)은 0이 될 수 없습니다.")
+
+        # 현재 범위에서 심볼을 찾기 위한 스케일링
+        self.range = self.range // total
+        scaled_value = (self.value - self.low) // self.range
+
+        # CMF 테이블에서 scaled_value가 속한 구간(인덱스)을 찾습니다.
+        # bisect_right는 cmf[i] <= scaled_value < cmf[i+1]을 만족하는 i를 찾습니다.
+        index = bisect.bisect_right(cmf_table, scaled_value) - 1
+
+        if index < 0 or (index + 1) >= len(cmf_table):
+            # 이 경우는 비트스트림이 손상되었거나 CMF 테이블이 잘못된 경우
+            raise RuntimeError(f"디코딩 오류: CMF 테이블에서 유효한 인덱스를 찾지 못했습니다. (scaled_value={scaled_value})")
+
+        r_start = cmf_table[index]
+        r_end = cmf_table[index + 1]
+        r_count = r_end - r_start
+
+        # 인코딩과 동일하게 범위를 갱신합니다.
+        self.low = self.low + r_start * self.range
+        self.range = r_count * self.range
+
+        # 범위를 정규화합니다.
+        self._renormalize_decode()
+
+        return index
+
+
+
+
+
+
+
+# --- 예제 데이터 ---
+
+# CMF 테이블 리스트 (심볼마다 다름)
+# CMF 형식: [0, count(S0), count(S0)+count(S1), ...]
+cmf_tables = [
+    [0, 5, 10, 15],      # 심볼 0, 1, 2 (총합 15)
+    [0, 20, 25, 40],     # 심볼 0, 1, 2 (총합 40)
+    [0, 1, 10],          # 심볼 0, 1 (총합 10)
+    [0, 5, 10, 15, 20],  # 심볼 0, 1, 2, 3 (총합 20)
+    [0, 50, 100],        # 심볼 0, 1 (총합 100)
+    [0, 10, 20, 30]      # 심볼 0, 1, 2 (총합 30)
+]
+
+# 인코딩할 심볼 인덱스 리스트
+# 각 인덱스는 cmf_tables의 해당 CMF 테이블 내에서의 인덱스입니다.
+indices_to_encode = [
+    1,  # cmf_tables[0] ([5, 10) 구간)
+    2,  # cmf_tables[1] ([25, 40) 구간)
+    0,  # cmf_tables[2] ([0, 1) 구간)
+    3,  # cmf_tables[3] ([15, 20) 구간)
+    0,  # cmf_tables[4] ([0, 50) 구간)
+    1   # cmf_tables[5] ([10, 20) 구간)
+]
+
+print(f"원본 심볼 인덱스: {indices_to_encode}\n")
+
+# --- 1. 인코딩 ---
+print("--- 인코딩 시작 ---")
+# 48비트 정밀도로 인코더 생성
+encoder = ArithmeticEncoder(precision_bits=48)
+
+for cmf, idx in zip(cmf_tables, indices_to_encode):
+    print(f"인코딩: 인덱스 {idx} (CMF: {cmf})")
+    encoder.encode(cmf, idx)
+
+# 모든 심볼 인코딩 후 flush() 호출
+bitstream = encoder.flush()
+
+print("--- 인코딩 완료 ---")
+print(f"압축된 비트스트림 (총 {len(bitstream)} 바이트):")
+print(f"{bitstream.hex()} (16진수)")  # 파일 저장을 위해 16진수로 출력
+print(f"비트: {''.join(f'{b:08b}' for b in bitstream)}\n")
+
+
+# --- 2. 파일 저장 (요청 사항) ---
+file_path = "compressed_data.bin"
+try:
+    with open(file_path, "wb") as f:
+        f.write(bitstream)
+    print(f"비트스트림을 '{file_path}' 파일로 저장했습니다.\n")
+except Exception as e:
+    print(f"파일 저장 오류: {e}\n")
+
+
+# --- 3. 디코딩 ---
+print("--- 디코딩 시작 ---")
+# 인코더와 반드시 동일한 정밀도로 디코더 생성
+decoder = ArithmeticDecoder(precision_bits=48)
+
+# 디코딩 시작 전 set_bitstream() 호출
+# (파일에서 다시 읽어와서 사용할 수도 있습니다)
+# with open(file_path, "rb") as f:
+#     read_bitstream = f.read()
+# decoder.set_bitstream(read_bitstream)
+
+decoder.set_bitstream(bitstream)
+print("디코더에 비트스트림 설정 완료.\n")
+
+decoded_indices = []
+# 디코딩 시에는 인코딩할 때 사용한 CMF 테이블 순서와 동일하게 제공해야 합니다.
+for cmf in cmf_tables:
+    decoded_idx = decoder.decode(cmf)
+    print(f"디코딩: 인덱스 {decoded_idx} (CMF: {cmf})")
+    decoded_indices.append(decoded_idx)
+
+print("--- 디코딩 완료 ---\n")
+
+# --- 4. 결과 검증 ---
+print(f"원본 인덱스: {indices_to_encode}")
+print(f"복원 인덱스: {decoded_indices}")
+
+assert indices_to_encode == decoded_indices
+print("\n✅ 검증 성공: 원본과 복원된 데이터가 일치합니다.")
 
 
 
@@ -311,60 +366,4 @@ def pmf_to_cdf(pmf: list[list[float]],
 
 
 
-if __name__ == "__main__":
-    # 1. 설정
-    PRECISION = 10
-    M = 1 << PRECISION  # M = 1024
-    FILE_NAME = "encoded_data.bin"
 
-    # 2. 인코딩할 데이터 준비
-    cmf_0 = [0, 307, 614, 1024]
-    cmf_1 = [0, 512, 1024]
-    cmf_2 = [0, 102, 307, 922, 1024]
-
-    all_cmf_tables = [cmf_0, cmf_1, cmf_2, cmf_0]
-    symbol_indices = [1,      0,     3,     2] # [1, 0, 3, 2]가 나와야 함
-
-    print(f"Original Indices: {symbol_indices}")
-    print("-" * 30)
-
-    # 3. 인코딩 및 파일 저장
-    encoder = RansEncoderDecoder(precision_bits=PRECISION)
-    try:
-        encoder.encode(all_cmf_tables, symbol_indices)
-        
-        # flush()는 이제 bytes를 반환
-        binary_bitstream = encoder.flush()
-        
-        print(f"Encoding successful.")
-        print(f"Total bytes written: {len(binary_bitstream)}")
-
-        # 파일에 바이너리 쓰기
-        with open(FILE_NAME, "wb") as f:
-            f.write(binary_bitstream)
-        print(f"File '{FILE_NAME}' saved.")
-        print("-" * 30)
-
-        # 4. 파일 읽기 및 디코딩
-        decoder = RansEncoderDecoder(precision_bits=PRECISION)
-        
-        # 파일에서 바이너리 읽기
-        print(f"Reading file '{FILE_NAME}'...")
-        with open(FILE_NAME, "rb") as f:
-            read_bitstream = f.read()
-
-        # (필수) 디코딩 전 set_bitstream(bytes) 호출
-        decoder.set_bitstream(read_bitstream)
-        
-        # CMF 테이블을 순서대로 전달하여 디코딩
-        decoded_indices = decoder.decode(all_cmf_tables)
-
-        print(f"Decoding successful.")
-        print(f"Decoded Indices:  {decoded_indices}")
-
-        # 5. 검증
-        assert symbol_indices == decoded_indices
-        print("\nVerification: SUCCESS! (Original == Decoded)")
-
-    except (ValueError, IOError) as e:
-        print(f"\nError: {e}")
