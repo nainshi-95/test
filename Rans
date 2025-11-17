@@ -30,10 +30,7 @@ class RansEncoderDecoder:
         self.decode_bitstream = []  # list[int]
 
     def encode(self, cmf_tables, indices):
-        """
-        심볼 인덱스 리스트를 인코딩하여 내부 상태를 업데이트합니다.
-        (이전 버전과 동일)
-        """
+        """ (이전과 동일) """
         
         if len(cmf_tables) != len(indices):
             raise ValueError("CMF 테이블 리스트와 인덱스 리스트의 길이가 다릅니다.")
@@ -61,13 +58,7 @@ class RansEncoderDecoder:
             self.encode_state = (self.encode_state // f) * self.M + (self.encode_state % f) + c
 
     def flush(self) -> bytes:
-        """
-        인코딩을 완료하고, 최종 상태를 포함한 전체 비트스트림을 'bytes' 객체로 반환합니다.
-        인코더의 상태는 초기화됩니다.
-
-        Returns:
-            bytes: 파일 저장이 가능한 최종 바이너리 비트스트림.
-        """
+        """ (이전과 동일) """
         
         # 32비트 정수 청크 리스트를 생성
         final_stream_chunks = list(self.encode_bitstream)
@@ -75,6 +66,7 @@ class RansEncoderDecoder:
         state = self.encode_state
         
         # LIFO: 최종 상태(state)를 64비트(청크 2개)로 리스트 *끝*에 추가
+        # [..., state_low, state_high] 순서로 저장됨
         for _ in range(self.STATE_CHUNKS):
             final_stream_chunks.append(state & ((1 << self.CHUNK_BITS) - 1))
             state >>= self.CHUNK_BITS
@@ -99,11 +91,7 @@ class RansEncoderDecoder:
 
     def set_bitstream(self, bitstream_bytes: bytes):
         """
-        디코딩을 위해 'bytes' 비트스트림을 설정합니다.
-        비트스트림에서 초기 상태(state)를 읽어오고, 나머지를 저장합니다.
-
-        Args:
-            bitstream_bytes (bytes): flush()에서 반환된 전체 바이너리 비트스트림.
+        디코딩을 위해 'bytes' 비트스트림을 설정합니다. (버그 수정됨)
         """
         if not bitstream_bytes or len(bitstream_bytes) % self.CHUNK_BYTES != 0:
             raise ValueError(f"비트스트림 크기가 {self.CHUNK_BYTES}바이트 배수가 아닙니다 (데이터 손상 가능성).")
@@ -113,27 +101,35 @@ class RansEncoderDecoder:
         if num_chunks < self.STATE_CHUNKS:
              raise ValueError("비트스트림이 상태(state) 정보를 읽기에 너무 짧습니다.")
             
-        # [수정] bytes -> list[int] 변환
         try:
             unpacked_tuple = struct.unpack(f'<{num_chunks}I', bitstream_bytes)
-            # 디코더는 pop()을 사용하므로 list로 변환
             self.decode_bitstream = list(unpacked_tuple) 
         except struct.error as e:
             raise IOError(f"비트스트림 언패킹 실패: {e}")
 
-        # LIFO: 비트스트림의 *끝*에서 상태(state)를 읽어옵니다. (flush()와 대칭)
+        # --- [버그 수정 지점] ---
+        # LIFO: 비트스트림의 *끝*에서 상태(state)를 읽어옵니다.
+        # flush가 [..., state_low, state_high]로 썼으므로,
+        # pop()은 state_high, state_low 순서로 나옵니다.
         state = 0
+        
+        # state = (state_high << 32) | (state_low << 0) 가 되어야 합니다.
+        
+        # i=0일 때 pop() -> state_high
+        # i=1일 때 pop() -> state_low
         for i in range(self.STATE_CHUNKS):
-            chunk = self.decode_bitstream.pop()
-            state |= (chunk << (self.CHUNK_BITS * i))
+            chunk = self.decode_bitstream.pop() 
+            # i=0일 때 state_high -> 32비트 시프트
+            # i=1일 때 state_low  -> 0비트 시프트
+            shift = (self.STATE_CHUNKS - 1 - i) * self.CHUNK_BITS 
+            state |= (chunk << shift)
             
         self.decode_state = state
+        # --- [수정 완료] ---
+
 
     def decode(self, cmf_tables):
-        """
-        설정된 비트스트림과 CMF 테이블을 사용하여 심볼 인덱스 리스트를 복원합니다.
-        (이전 버전과 동일)
-        """
+        """ (이전과 동일) """
         
         state = self.decode_state
         chunks = self.decode_bitstream
@@ -152,7 +148,8 @@ class RansEncoderDecoder:
             index = bisect.bisect_right(cmf, slot) - 1
 
             if not (0 <= index < len(cmf) - 1):
-                raise ValueError(f"디코딩 실패: slot {slot}이 CMF 범위에 없습니다.")
+                # (디버깅) 만약 여기서 에러가 난다면 state가 잘못 복원된 것입니다.
+                raise ValueError(f"디코딩 실패: slot {slot} (state: {state})이 CMF 범위에 없습니다.")
 
             decoded_indices.append(index)
 
@@ -185,7 +182,7 @@ if __name__ == "__main__":
     cmf_2 = [0, 102, 307, 922, 1024]
 
     all_cmf_tables = [cmf_0, cmf_1, cmf_2, cmf_0]
-    symbol_indices = [1,      0,     3,     2]
+    symbol_indices = [1,      0,     3,     2] # [1, 0, 3, 2]가 나와야 함
 
     print(f"Original Indices: {symbol_indices}")
     print("-" * 30)
@@ -230,8 +227,3 @@ if __name__ == "__main__":
 
     except (ValueError, IOError) as e:
         print(f"\nError: {e}")
-
-
-
-
-
