@@ -7,8 +7,7 @@ from dataclasses import dataclass
 from typing import List, Deque, Optional, Tuple, Sequence
 
 # ----------------------------------------------------------------------------
-# 1. (이전 답변) pmf_to_quantized_cdf 함수
-# (이 함수는 변경 없음)
+# 1. pmf_to_quantized_cdf (변경 없음)
 # ----------------------------------------------------------------------------
 def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
     # ... (이전과 동일) ...
@@ -49,8 +48,7 @@ def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
     return cdf
 
 # ----------------------------------------------------------------------------
-# 2. (이전 답변) RansSymbol
-# (이 자료구조는 변경 없음)
+# 2. RansSymbol (변경 없음)
 # ----------------------------------------------------------------------------
 @dataclass
 class RansSymbol:
@@ -59,63 +57,58 @@ class RansSymbol:
     bypass: bool
 
 # ----------------------------------------------------------------------------
-# 3. [수정됨] 바이트 스트리밍 rANS 헬퍼
+# 3. 바이트 헬퍼 (Encoder는 지난번 수정, Decoder가 이번 수정)
 # ----------------------------------------------------------------------------
 
 class RansByteEncoder:
-    """1바이트 단위로 출력하는 rANS 인코더 헬퍼"""
+    """(지난번 수정된 버전) 1바이트 단위 인코더 헬퍼"""
     def __init__(self, precision):
         self.precision = precision
         self.scale = 1 << precision
-        
-        self.L_BASE = (1 << 16) # Renorm 하한
-        self.TOP = (1 << 24)    # Renorm 상한 (L_BASE * 256)
-        
+        self.L_BASE = (1 << 16)
+        self.TOP = (1 << 24)
         self.state = self.L_BASE
         self.stream = bytearray()
 
     def encode(self, start, freq):
-        """심볼(start, freq)을 인코딩합니다."""
         x = self.state
-        
-        # [수정됨] Renormalization 임계값 계산 수정
-        # (self.L_BASE * freq) >> self.precision  <- (오류)
-        x_max = (self.TOP >> self.precision) * freq # <- (수정)
-        
-        # Renormalization (상태가 너무 커지면 8비트씩 출력)
+        x_max = (self.TOP >> self.precision) * freq # (지난번 수정된 부분)
         while x >= x_max:
             self.stream.append(x & 0xFF)
             x >>= 8
-            
         self.state = ((x // freq) * self.scale) + (x % freq) + start
 
     def flush(self) -> bytes:
-        """
-        최종 상태를 스트림에 쓰고, LIFO 순서를 뒤집어 FIFO 스트림을 반환합니다.
-        """
         x = self.state
-        # 4바이트 flush
+        # 4바이트 flush (LIFO 순서로 추가)
         self.stream.append((x >> 0) & 0xFF)
         self.stream.append((x >> 8) & 0xFF)
         self.stream.append((x >> 16) & 0xFF)
         self.stream.append((x >> 24) & 0xFF)
-        
+        # 전체를 뒤집어 FIFO 스트림 반환
         return bytes(reversed(self.stream))
 
+
 class RansByteDecoder:
-    """1바이트 단위로 입력받는 rANS 디코더 헬퍼 (변경 없음)"""
+    """[수정됨] 1바이트 단위 디코더 헬퍼 (pop() -> ptr)"""
     def __init__(self, precision, stream: bytes):
         self.precision = precision
         self.scale = 1 << precision
         self.L_BASE = (1 << 16)
         
-        self.stream = bytearray(stream) 
+        # [수정] 스트림을 바이트 객체로 저장
+        self.stream: bytes = stream 
+        self.ptr: int = 0 # [수정] 포인터(인덱스) 사용
         
-        self.state = 0
-        self.state = (self.state << 8) | self.stream.pop()
-        self.state = (self.state << 8) | self.stream.pop()
-        self.state = (self.state << 8) | self.stream.pop()
-        self.state = (self.state << 8) | self.stream.pop()
+        # [수정] 스트림의 맨 앞 4바이트(FIFO)를 읽어 상태 초기화
+        # 인코더가 [B0, B1, B2, B3] (LIFO) -> [B3, B2, B1, B0] (FIFO)로 썼음
+        b0 = self.stream[3]
+        b1 = self.stream[2]
+        b2 = self.stream[1]
+        b3 = self.stream[0]
+        
+        self.state = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        self.ptr = 4 # 데이터(Renorm)는 인덱스 4부터 시작
 
     def get_symbol(self) -> int:
         """현재 상태에서 누적 빈도를 읽습니다."""
@@ -125,15 +118,16 @@ class RansByteDecoder:
         """심볼(start, freq)을 기반으로 디코더 상태를 업데이트합니다."""
         self.state = freq * (self.state >> self.precision) + (self.state & (self.scale - 1)) - start
         
+        # [수정] pop() 대신 ptr로 스트림에서 읽기
         while self.state < self.L_BASE:
-            self.state = (self.state << 8) | self.stream.pop()
+            self.state = (self.state << 8) | self.stream[self.ptr]
+            self.ptr += 1
 
 # ----------------------------------------------------------------------------
-# 4. (이전 답변) RansEncoderLibByte / RansDecoderLibByte
-# (이 클래스들은 변경 없음)
+# 4. Lib 클래스 (변경 없음)
 # ----------------------------------------------------------------------------
 class RansEncoderLibByte:
-    """RansByteEncoder를 사용하는 Lib (BPP 문제 해결)"""
+    # ... (RansEncoderLibByte 코드는 이전 답변과 동일) ...
     def __init__(self, precision):
         self._syms: List[RansSymbol] = []
         self._stream: bytes = b""
@@ -143,21 +137,17 @@ class RansEncoderLibByte:
         self.precision_backup = self.encoder.precision
         self.scale_backup = self.encoder.scale
         self.bypass_scale = 1 << self.bypass_precision
-
     def reset(self):
         self._syms.clear()
         self._stream = b""
         self.encoder = RansByteEncoder(self.encoder.precision)
-
     def get_encoded_stream(self) -> bytes:
         return self._stream
-
     def encode_with_indexes(
         self,
         symbols: List[int], indexes: List[int], cdfs: List[List[int]],
         cdfs_sizes: List[int], offsets: List[int]
     ):
-        # (이전과 동일)
         for i in range(len(symbols)):
             cdf_idx = indexes[i]
             if cdf_idx < 0: continue
@@ -188,12 +178,9 @@ class RansEncoderLibByte:
                 for j in range(n_bypass):
                     val1 = (raw_val >> (j * self.bypass_precision)) & self.max_bypass_val
                     self._syms.append(RansSymbol(start=val1, range=0, bypass=True))
-
     def flush(self):
-        # (이전과 동일)
         bypass_precision = self.bypass_precision
         bypass_scale = self.bypass_scale
-        
         for sym in reversed(self._syms):
             if not sym.bypass:
                 self.encoder.precision = self.precision_backup
@@ -203,93 +190,73 @@ class RansEncoderLibByte:
                 self.encoder.precision = bypass_precision
                 self.encoder.scale = bypass_scale
                 self.encoder.encode(sym.start, 1) # (start=val, freq=1)
-
         self.encoder.precision = self.precision_backup
         self.encoder.scale = self.scale_backup
-        
         self._stream = self.encoder.flush()
 
 
 class RansDecoderLibByte:
-    """RansByteDecoder를 사용하는 Lib (변경 없음)"""
+    # ... (RansDecoderLibByte 코드는 이전 답변과 동일, RansByteDecoder를 호출) ...
     def __init__(self, precision):
         self.precision = precision
         self.decoder = None
         self.bypass_precision = 4
         self.max_bypass_val = (1 << self.bypass_precision) - 1
-        
         self.precision_backup = self.precision
         self.scale_backup = 1 << self.precision
         self.bypass_scale = 1 << self.bypass_precision
-
     def set_stream(self, encoded: bytes):
+        # [수정] 버그가 수정된 RansByteDecoder를 생성
         self.decoder = RansByteDecoder(self.precision, encoded)
-
     def decode_stream(
         self,
         indexes: List[int], cdfs: List[List[int]],
         cdfs_sizes: List[int], offsets: List[int]
     ) -> List[int]:
-        
-        # (이전과 동일)
         index_size = len(indexes)
         output = [0] * index_size
-        
         bypass_precision = self.bypass_precision
         bypass_scale = self.bypass_scale
-
         for i in range(index_size):
             cdf_idx = indexes[i]
             offset = offsets[cdf_idx]
             if cdf_idx < 0:
                 output[i] = offset
                 continue
-            
             cdf = cdfs[cdf_idx]
             cdf_size = cdfs_sizes[cdf_idx]
             max_value = cdf_size - 2
-            
             self.decoder.precision = self.precision_backup
             self.decoder.scale = self.scale_backup
-            
             cum_freq = self.decoder.get_symbol()
             cdf_view = cdf[:cdf_size] 
             s = bisect.bisect_right(cdf_view, cum_freq) - 1
             self.decoder.decode(cdf[s], cdf[s + 1] - cdf[s])
-
             value = s
-
             if value == max_value:
                 self.decoder.precision = bypass_precision
                 self.decoder.scale = bypass_scale
-                
                 val = self.decoder.get_symbol()
                 self.decoder.decode(val, 1)
                 n_bypass = val
-                
                 while val == self.max_bypass_val:
                     val = self.decoder.get_symbol()
                     self.decoder.decode(val, 1)
                     n_bypass += val
-
                 raw_val = 0
                 for j in range(n_bypass):
                     val = self.decoder.get_symbol()
                     self.decoder.decode(val, 1)
                     raw_val |= (val << (j * self.bypass_precision))
-                
                 if (raw_val & 1):
                     value = -(raw_val >> 1) - 1
                 else:
                     value = (raw_val >> 1) + max_value
-
             output[i] = value + offset
-            
         return output
 
 # ----------------------------------------------------------------------------
-# 5. (이전 답변) 테스트 코드
-# (이 코드는 변경 없음)
+# 5. 테스트 코드 (변경 없음)
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     
@@ -297,7 +264,6 @@ if __name__ == "__main__":
         print(f"\n--- {test_name} ---")
         print(f"원본 심볼: {test_symbols} (총 {len(test_symbols)}개)")
 
-        # C++ 코드의 precision
         precision = 16 
         
         my_cdf = pmf_to_quantized_cdf(pmf, precision)
