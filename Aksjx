@@ -1,0 +1,204 @@
+import torch
+from torch.distributions import Laplace
+
+def get_reverse_zigzag_indices():
+    """
+    8x8 역방향 지그재그 스캔 인덱스를 생성합니다 ( (7,7) 부터 (0,0) 까지 ).
+    """
+    # 표준 정방향 지그재그 스캔 인덱스
+    zigzag_indices = [
+        (0, 0), (0, 1), (1, 0), (2, 0), (1, 1), (0, 2), (0, 3), (1, 2),
+        (2, 1), (3, 0), (4, 0), (3, 1), (2, 2), (1, 3), (0, 4), (0, 5),
+        (1, 4), (2, 3), (3, 2), (4, 1), (5, 0), (6, 0), (5, 1), (4, 2),
+        (3, 3), (2, 4), (1, 5), (0, 6), (0, 7), (1, 6), (2, 5), (3, 4),
+        (4, 3), (5, 2), (6, 1), (7, 0), (7, 1), (6, 2), (5, 3), (4, 4),
+        (3, 5), (2, 6), (1, 7), (2, 7), (3, 6), (4, 5), (5, 4), (6, 3),
+        (7, 2), (7, 3), (6, 4), (5, 5), (4, 6), (3, 7), (4, 7), (5, 6),
+        (6, 5), (7, 4), (7, 5), (6, 6), (5, 7), (6, 7), (7, 6), (7, 7)
+    ]
+    # 순서를 뒤집어 반환
+    return list(reversed(zigzag_indices))
+
+
+class EntropyEncoder:
+    """
+    모델이 예측한 scale을 양자화하고, 
+    이에 맞는 CMF 테이블과 심볼 인덱스를 생성하는 헬퍼 클래스입니다.
+    """
+    def __init__(self, gaussian_encoder: GaussianEncoder, device='cuda'):
+        """
+        학습된 GaussianEncoder의 파라미터를 기반으로 초기화합니다.
+        """
+        self.device = device
+        
+        # GaussianEncoder에서 스케일 테이블 및 관련 파라미터 복사
+        self.scale_min = gaussian_encoder.scale_min
+        self.scale_max = gaussian_encoder.scale_max
+        self.scale_level = gaussian_encoder.scale_level
+        self.scale_table = gaussian_encoder.scale_table.to(self.device)
+        self.log_scale_min = gaussian_encoder.log_scale_min
+        self.log_scale_step = gaussian_encoder.log_scale_step
+        
+        # CMF 테이블 생성을 위한 심볼 범위 정의
+        # (산술 부호화기의 알파벳 범위와 일치해야 함)
+        self.symbol_min_val = -2048
+        self.symbol_max_val = 2047
+        self.symbols = torch.arange(
+            self.symbol_min_val, self.symbol_max_val + 1, 
+            device=self.device, dtype=torch.float32
+        )
+        self.alphabet_size = len(self.symbols)
+
+        # CMF 테이블 캐시 (Key: scale_index, Value: cdf_table)
+        self.cdf_cache = {}
+
+
+    def _quantize_scale(self, scale: torch.Tensor) -> torch.Tensor:
+        """
+        연속적인 scale 값을 scale_table의 인덱스로 양자화합니다.
+        """
+        scale = torch.clamp(scale, self.scale_min, self.scale_max)
+        log_scale = torch.log(scale)
+        norm_log_scale = (log_scale - self.log_scale_min)
+        scale_index = torch.round(norm_log_scale / self.log_scale_step)
+        scale_index = torch.clamp(scale_index, 0, self.scale_level - 1).int()
+        return scale_index
+
+    def _get_cdf_table(self, scale_index: torch.Tensor) -> torch.Tensor:
+        """
+        주어진 scale_index에 대한 CMF 테이블을 생성하거나 캐시에서 검색합니다.
+        """
+        idx = scale_index.item()
+        if idx in self.cdf_cache:
+            return self.cdf_cache[idx]
+
+        # 테이블에서 양자화된 스케일 값 가져오기
+        quantized_scale = self.scale_table[idx]
+        
+        dist = Laplace(torch.tensor(0.0, device=self.device),
+                       torch.tensor(quantized_scale, device=self.device))
+
+        # PMF 계산: P(k) = CDF(k + 0.5) - CDF(k - 0.5)
+        pmf = dist.cdf(self.symbols + 0.5) - dist.cdf(self.symbols - 0.5)
+        
+        # Tail (범위 밖) 확률을 첫/마지막 bin에 추가
+        tail_lower = dist.cdf(torch.tensor(self.symbol_min_val - 0.5, device=self.device))
+        tail_upper = 1.0 - dist.cdf(torch.tensor(self.symbol_max_val + 0.5, device=self.device))
+        
+        pmf[0] += tail_lower
+        pmf[-1] += tail_upper
+        
+        # 정규화 (합이 1이 되도록 보장)
+        pmf = pmf / pmf.sum()
+
+        # PMF -> CDF 변환
+        cdf = torch.cumsum(pmf, dim=0)
+        
+        # CMF는 [0, ..., 1] 형태여야 함
+        cdf = F.pad(cdf, (1, 0), 'constant', 0.0) # 맨 앞에 0 추가
+        cdf[-1] = 1.0 # 마지막 값 1로 보장
+        
+        self.cdf_cache[idx] = cdf
+        return cdf
+
+    def get_symbol_and_cdf(self, symbol_value: torch.Tensor, scale_value: torch.Tensor):
+        """
+        최종 함수: 정수 심볼과 실수 스케일 값을 받아,
+        산술 부호화에 필요한 CMF 테이블과 심볼 인덱스를 반환합니다.
+        
+        Returns:
+            (torch.Tensor, int): (cmf_table, symbol_index)
+        """
+        # 1. 스케일을 양자화하여 스케일 테이블의 인덱스 획득
+        scale_index = self._quantize_scale(scale_value)
+        
+        # 2. 해당 인덱스의 CMF 테이블 획득
+        cmf_table = self._get_cdf_table(scale_index)
+        
+        # 3. 심볼 값을 CMF 테이블 범위 내로 클램핑
+        symbol_clamped = torch.clamp(
+            symbol_value, self.symbol_min_val, self.symbol_max_val
+        )
+        
+        # 4. CMF 알파벳 내에서 심볼의 인덱스 계산
+        # (알파벳이 min_val부터 시작하므로)
+        symbol_index = symbol_clamped.int().item() - self.symbol_min_val
+        
+        return cmf_table, symbol_index
+
+
+def initialize_for_encoding(trained_model: Model):
+    """
+    학습된 모델을 인코딩을 위해 준비시킵니다.
+    """
+    device = next(trained_model.parameters()).device
+    trained_model.eval()
+    
+    # 1. 엔트로피 인코더 헬퍼 클래스 생성
+    entropy_helper = EntropyEncoder(trained_model.context_modeler.gaussian_encoder, device)
+    
+    # 2. 역방향 지그재그 스캔 순서 가져오기
+    scan_order = get_reverse_zigzag_indices()
+    
+    return trained_model, entropy_helper, scan_order, device
+
+
+def encode_block_generator(x_patch_8x8: torch.Tensor, model: Model, 
+                           entropy_helper: EntropyEncoder, scan_order: list, device: torch.device):
+    """
+    단일 8x8 패치(Y 채널)를 인코딩하는 제너레이터입니다.
+    
+    Yields:
+        (cmf_table, symbol_index) : 64개의 계수에 대해 순차적으로 반환합니다.
+    """
+    
+    if x_patch_8x8.dim() == 2:
+        x_patch_8x8 = x_patch_8x8.view(1, 1, 8, 8) # Batch, Channel 차원 추가
+    
+    x_patch_8x8 = x_patch_8x8.to(device)
+
+    with torch.no_grad():
+        # --- 1. 모델의 정방향 연산 수행 (병렬) ---
+        
+        # 1a. 정규화 (0~1 -> -1~1)
+        x = x_patch_8x8 * 2 - 1
+        
+        # 1b. DCT
+        x_squeeze = x.squeeze(dim=1)
+        coefficients = torch.einsum('bhw, chw -> bc', x_squeeze, model.dct_basis_64_8_8)
+        coefficients = coefficients.view(1, 1, 8, 8)
+
+        # 1c. 양자화 (Qmap 적용)
+        qmap = torch.clamp_min(model.qmap, 1e-5)
+        coefficients_quantized = coefficients / qmap
+        
+        # 1d. 정수 심볼 획득 (이것이 우리가 인코딩할 값)
+        coefficients_hat = torch.round(coefficients_quantized) # Shape: [1, 1, 8, 8]
+        
+        # 1e. ContextModeler로 'scales' 예측
+        # (모델이 병렬로 학습되었으므로, 인코딩 시에도 병렬로 예측)
+        b, _, h, w = coefficients_hat.size()
+        ctx_param = model.context_modeler.masked_conv(coefficients_hat)
+        pos_param = model.context_modeler.position_embedding.expand(b, -1, h, w)
+        scales = model.context_modeler.parameters_predictor(
+            torch.cat((ctx_param, pos_param), dim=1)
+        ) # Shape: [1, 1, 8, 8]
+        
+        # --- 2. 직렬화 및 CMF 생성 (순차적) ---
+        
+        # 8x8 2D 텐서로 변환
+        coefficients_hat_flat = coefficients_hat.squeeze() # [8, 8]
+        scales_flat = scales.squeeze()                   # [8, 8]
+        
+        # 7. 스캔 순서대로 반복
+        for (r, c) in scan_order:
+            # 현재 위치의 심볼(정수 계수)과 스케일(분포 파라미터)
+            symbol = coefficients_hat_flat[r, c]
+            scale = scales_flat[r, c]
+            
+            # CMF 테이블과 해당 심볼의 인덱스 획득
+            cmf_table, symbol_index = entropy_helper.get_symbol_and_cdf(symbol, scale)
+            
+            # 산술 부호화기로 전달 (Yield)
+            yield (cmf_table, symbol_index)
+
