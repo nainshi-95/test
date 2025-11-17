@@ -1,0 +1,235 @@
+import os
+from PIL import Image
+import numpy as np
+from skimage.metrics import peak_signal_noise_ratio
+import tempfile
+import shutil
+
+# 이전 답변에서 제공된 get_jpeg_ecs_size 함수를 여기에 포함합니다.
+def get_jpeg_ecs_size(filepath):
+    """
+    JPEG 파일의 순수 데이터(Entropy-Coded Segment) 크기를 반환합니다.
+
+    Args:
+        filepath (str): JPEG 파일 경로
+
+    Returns:
+        int: ECS 데이터의 크기 (바이트)
+        None: JPEG 마커를 찾지 못한 경우
+    """
+    SOS_MARKER = b'\xFF\xDA'  # Start of Scan
+    EOI_MARKER = b'\xFF\xD9'  # End of Image
+
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+
+        eoi_pos = data.rfind(EOI_MARKER) 
+        if eoi_pos == -1:
+            # print(f"오류: EOI (FF D9) 마커를 찾을 수 없습니다. (파일: {filepath})")
+            return None
+
+        sos_pos = data.rfind(SOS_MARKER, 0, eoi_pos)
+        
+        if sos_pos == -1:
+            # print(f"오류: SOS (FF DA) 마커를 찾을 수 없습니다. (파일: {filepath})")
+            return None
+
+        scan_header_len = int.from_bytes(data[sos_pos+2 : sos_pos+4], 'big')
+        ecs_start = sos_pos + 2 + scan_header_len
+        ecs_size = eoi_pos - ecs_start
+        
+        return ecs_size
+
+    except FileNotFoundError:
+        # print(f"오류: 파일을 찾을 수 없습니다. (파일: {filepath})")
+        return None
+    except Exception as e:
+        # print(f"파일 처리 중 오류 발생: {e}")
+        return None
+
+# -----------------------------------------------------------------------------
+
+def process_kodak_dataset(kodak_dataset_path, qp_value):
+    """
+    Kodak 데이터셋의 PNG 이미지를 처리하여 Y 채널의 BPP와 PSNR을 계산합니다.
+
+    Args:
+        kodak_dataset_path (str): Kodak 데이터셋 PNG 파일들이 있는 폴더 경로.
+        qp_value (int): JPEG 압축에 사용할 양자화 파라미터 (QP).
+                        이 값은 PIL의 'quality' 인자로 매핑됩니다.
+                        PIL quality는 1(최악) ~ 95(최고) 범위가 일반적입니다.
+                        여기서는 QP를 역으로 매핑합니다.
+                        (예: qp=0 -> quality=95, qp=5 -> quality=90, ...)
+                        QP 범위를 조절하여 RD curve를 그릴 수 있습니다.
+                        **주의**: QP와 PIL quality는 직접적인 관계가 아니므로,
+                        이 매핑은 실험적으로 조정해야 합니다.
+    Returns:
+        tuple: (average_bpp_y, average_psnr_y) - 데이터셋 전체의 평균 BPP와 PSNR.
+               오류 발생 시 (None, None) 반환.
+    """
+    
+    # PIL quality factor로 변환 (QP와 quality는 직접적인 매핑이 아님. 조정 필요)
+    # 일반적인 QP 값 범위 (예: 0~51)에 따라 quality 팩터를 조정하세요.
+    # 여기서는 예시로 '품질 = 95 - QP' 형태로 매핑합니다. (QP 0이 가장 고품질)
+    # QP 값이 높아질수록 품질이 떨어지므로, quality는 감소해야 합니다.
+    # PIL quality는 일반적으로 1-95 범위에서 효과적입니다. 100은 무손실에 가깝습니다.
+    # qp_value = 0 -> quality = 95 (best)
+    # qp_value = 10 -> quality = 85
+    # qp_value = 94 -> quality = 1 (worst)
+    
+    jpeg_quality_factor = max(1, 95 - qp_value) 
+    # 혹은 qp_value가 1부터 시작한다면: jpeg_quality_factor = 100 - (qp_value * X)
+    
+    print(f"\n--- QP: {qp_value}, JPEG Quality Factor: {jpeg_quality_factor} ---")
+
+    total_bpp_y = 0.0
+    total_psnr_y = 0.0
+    processed_images_count = 0
+    
+    # 임시 디렉토리 생성
+    temp_dir = tempfile.mkdtemp()
+    print(f"임시 파일 저장 디렉토리: {temp_dir}")
+
+    for filename in os.listdir(kodak_dataset_path):
+        if filename.endswith(".png"):
+            filepath = os.path.join(kodak_dataset_path, filename)
+            print(f"처리 중: {filename}")
+
+            try:
+                # 1. 이미지 로드 및 Y 도메인으로 변경
+                img_orig = Image.open(filepath).convert('YCbCr')
+                img_y_orig = np.array(img_orig)[:, :, 0] # Y 채널 추출 (NumPy 배열)
+                
+                h_orig, w_orig = img_y_orig.shape
+
+                # 8x8 블록으로 쪼개기 위한 패딩 계산
+                pad_h = (8 - (h_orig % 8)) % 8
+                pad_w = (8 - (w_orig % 8)) % 8
+
+                img_y_padded = np.pad(img_y_orig, ((0, pad_h), (0, pad_w)), 'constant', constant_values=0)
+
+                h_padded, w_padded = img_y_padded.shape
+
+                image_total_bpp_y = 0.0
+                image_total_psnr_y = 0.0
+                block_count = 0
+
+                for r in range(0, h_padded, 8):
+                    for c in range(0, w_padded, 8):
+                        block_orig_y = img_y_padded[r:r+8, c:c+8]
+                        
+                        # 2. 8x8 블록을 JPEG으로 저장
+                        # PIL Image 객체로 변환 (Y 채널만)
+                        block_img_pil = Image.fromarray(block_orig_y, mode='L') # 'L'은 8비트 그레이스케일
+
+                        temp_jpeg_path = os.path.join(temp_dir, f"block_{r}_{c}_{filename}.jpg")
+                        block_img_pil.save(temp_jpeg_path, format='jpeg', quality=jpeg_quality_factor)
+
+                        # 3. Y 도메인에서의 순수 실제 데이터의 bpp 계산
+                        ecs_size = get_jpeg_ecs_size(temp_jpeg_path)
+                        if ecs_size is None:
+                            print(f"경고: {temp_jpeg_path} 파일의 ECS 크기를 얻을 수 없습니다. 건너뜁니다.")
+                            continue
+                        
+                        # 8x8 블록이므로 총 64 픽셀
+                        block_bpp_y = (ecs_size * 8) / (8 * 8)
+                        image_total_bpp_y += block_bpp_y
+
+                        # 4. 압축된 블록 로드 및 PSNR 계산
+                        block_compressed_pil = Image.open(temp_jpeg_path)
+                        block_compressed_y = np.array(block_compressed_pil) # 이미 Y 채널이므로 바로 사용
+
+                        # PSNR 계산
+                        # data_range는 8비트 이미지의 최대값(255)입니다.
+                        block_psnr_y = peak_signal_noise_ratio(block_orig_y, block_compressed_y, data_range=255)
+                        image_total_psnr_y += block_psnr_y
+                        
+                        block_count += 1
+                        
+                if block_count > 0:
+                    avg_image_bpp_y = image_total_bpp_y / block_count
+                    avg_image_psnr_y = image_total_psnr_y / block_count
+                    
+                    total_bpp_y += avg_image_bpp_y
+                    total_psnr_y += avg_image_psnr_y
+                    processed_images_count += 1
+                    
+                    print(f"  -> {filename} 평균 BPP_Y: {avg_image_bpp_y:.4f}, 평균 PSNR_Y: {avg_image_psnr_y:.2f} dB")
+                else:
+                    print(f"  -> {filename} 블록 처리 실패 또는 없음.")
+
+            except Exception as e:
+                print(f"오류 발생 ({filename}): {e}")
+                
+    # 임시 디렉토리 삭제
+    shutil.rmtree(temp_dir)
+    print(f"임시 디렉토리 '{temp_dir}' 삭제 완료.")
+
+    if processed_images_count > 0:
+        overall_avg_bpp_y = total_bpp_y / processed_images_count
+        overall_avg_psnr_y = total_psnr_y / processed_images_count
+        print(f"\n--- 전체 데이터셋 요약 (QP: {qp_value}) ---")
+        print(f"전체 평균 BPP (Y 채널): {overall_avg_bpp_y:.4f}")
+        print(f"전체 평균 PSNR (Y 채널): {overall_avg_psnr_y:.2f} dB")
+        return overall_avg_bpp_y, overall_avg_psnr_y
+    else:
+        print("처리된 이미지가 없습니다.")
+        return None, None
+
+# --- 사용 예제 ---
+if __name__ == "__main__":
+    # Kodak 데이터셋 PNG 파일들이 있는 폴더 경로를 여기에 지정하세요.
+    # 예: kodak_dataset_path = "/home/user/kodak_dataset"
+    kodak_dataset_path = "A:/python_code/DB/Kodak"
+
+    # 예시를 위해 'kodak_dataset' 폴더와 PNG 파일 하나를 생성합니다.
+    # 실제 사용 시 이 부분은 제거하세요.
+    if not os.path.exists(kodak_dataset_path):
+        raise FileExistsError("Not Exists")
+
+    # RD curve를 그리기 위한 QP 값 리스트 (예시)
+    # 실제 QP 값 범위는 실험을 통해 조정하세요.
+    qp_values = [20, 40, 60, 80] 
+    
+    rd_points = []
+
+    for qp in qp_values:
+        avg_bpp, avg_psnr = process_kodak_dataset(kodak_dataset_path, qp)
+        if avg_bpp is not None and avg_psnr is not None:
+            rd_points.append((avg_bpp, avg_psnr))
+
+    print("\n--- RD Curve 포인트 ---")
+    for bpp, psnr in rd_points:
+        print(f"BPP: {bpp:.4f}, PSNR: {psnr:.2f} dB")
+
+    # 결과 시각화 (matplotlib 설치되어 있을 경우)
+    try:
+        import matplotlib.pyplot as plt
+        
+        if rd_points:
+            bpps = [p[0] for p in rd_points]
+            psnrs = [p[1] for p in rd_points]
+
+            plt.figure(figsize=(10, 6))
+            plt.plot(bpps, psnrs, marker='o', linestyle='-')
+            plt.title('RD Curve for Kodak Dataset (Y Channel, 8x8 Blocks)')
+            plt.xlabel('BPP (Bits Per Pixel)')
+            plt.ylabel('PSNR (dB)')
+            plt.grid(True)
+            plt.show()
+        else:
+            print("RD Curve를 그릴 데이터가 없습니다.")
+
+    except ImportError:
+        print("\nmatplotlib이 설치되어 있지 않습니다. pip install matplotlib 명령으로 설치하여 시각화할 수 있습니다.")
+    except Exception as e:
+        print(f"RD Curve 시각화 중 오류 발생: {e}")
+        
+    # 예시를 위해 생성된 더미 파일 및 폴더 삭제 (실제 사용 시 제거)
+    if os.path.exists(kodak_dataset_path):
+        try:
+            shutil.rmtree(kodak_dataset_path)
+            print(f"'{kodak_dataset_path}' 폴더 및 더미 파일 삭제 완료.")
+        except Exception as e:
+            print(f"더미 폴더 삭제 실패: {e}")
