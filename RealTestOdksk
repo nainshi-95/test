@@ -1,0 +1,373 @@
+import math
+import bisect
+import collections
+import enum
+import struct
+import threading
+from dataclasses import dataclass
+from typing import List, Deque, Optional, Tuple, Sequence
+
+# ----------------------------------------------------------------------------
+# [이전 답변] 1. pmf_to_quantized_cdf 함수
+# ----------------------------------------------------------------------------
+
+def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
+    """
+    PMF(확률 질량 함수)를 양자화된 CDF(누적 분포 함수)로 변환합니다.
+    """
+    cdf = [0] * (len(pmf) + 1)
+    scale = 1 << precision
+
+    for i, p in enumerate(pmf):
+        scaled_p = p * scale
+        # C++의 std::round(x) 동작(양수 x에 대해 floor(x + 0.5)) 모방
+        cdf[i + 1] = int(math.floor(scaled_p + 0.5))
+
+    total = sum(cdf)
+    if total == 0:
+        total = 1
+
+    for i in range(len(cdf)):
+        cdf[i] = (scale * cdf[i]) // total
+
+    current_sum = 0
+    for i in range(len(cdf)):
+        current_sum += cdf[i]
+        cdf[i] = current_sum
+
+    cdf[-1] = scale
+
+    n = len(cdf) - 1
+    for i in range(n):
+        if cdf[i] == cdf[i + 1]:
+            best_freq = (1 << 32) - 1
+            best_steal = -1
+            
+            for j in range(n):
+                freq = cdf[j + 1] - cdf[j]
+                if freq > 1 and freq < best_freq:
+                    best_freq = freq
+                    best_steal = j
+
+            assert best_steal != -1, "Cannot find a symbol to steal frequency from"
+
+            if best_steal < i:
+                for j in range(best_steal + 1, i + 1):
+                    cdf[j] -= 1
+            else:
+                assert best_steal > i, "best_steal == i, which should not happen"
+                for j in range(i + 1, best_steal + 1):
+                    cdf[j] += 1
+
+    assert cdf[0] == 0
+    assert cdf[-1] == scale
+    for i in range(n):
+        assert cdf[i + 1] > cdf[i], f"CDF not strictly increasing at index {i}"
+
+    return cdf
+
+# ----------------------------------------------------------------------------
+# [이전 답변] 2. Rans64 헬퍼 및 자료구조
+# ----------------------------------------------------------------------------
+
+class Rans64:
+    RANS64_L = (1 << 32)
+    PRECISION = 16
+    BYPASS_PRECISION = 4
+    MAX_BYPASS_VAL = (1 << BYPASS_PRECISION) - 1
+
+    @staticmethod
+    def enc_init() -> int:
+        return Rans64.RANS64_L
+
+    @staticmethod
+    def enc_flush(state: int, output_words: List[int]):
+        output_words.append(state & 0xFFFFFFFF)
+        output_words.append((state >> 32) & 0xFFFFFFFF)
+
+    @staticmethod
+    def enc_put(state: int, start: int, freq: int, precision: int, 
+                output_words: List[int]) -> int:
+        scale = 1 << precision
+        x_max = ((Rans64.RANS64_L >> precision) << 32) * freq
+        if state >= x_max:
+            output_words.append(state & 0xFFFFFFFF)
+            state >>= 32
+        return (state // freq) * scale + (state % freq) + start
+
+    @staticmethod
+    def enc_put_bits(state: int, val: int, n_bits: int, 
+                     output_words: List[int]) -> int:
+        x_max = 1 << (64 - n_bits)
+        if state >= x_max:
+            output_words.append(state & 0xFFFFFFFF)
+            state >>= 32
+        return (state << n_bits) | val
+
+    @staticmethod
+    def dec_init(stream_words: Sequence[int]) -> Tuple[int, int]:
+        state = (stream_words[0] & 0xFFFFFFFF) | \
+                ((stream_words[1] & 0xFFFFFFFF) << 32)
+        ptr_idx = 2
+        return state, ptr_idx
+
+    @staticmethod
+    def dec_get(state: int, precision: int) -> int:
+        scale = 1 << precision
+        return state & (scale - 1)
+
+    @staticmethod
+    def dec_advance(state: int, ptr_idx: int, 
+                    start: int, freq: int, precision: int, 
+                    stream_words: Sequence[int]) -> Tuple[int, int]:
+        scale = 1 << precision
+        state = freq * (state >> precision) + (state & (scale - 1)) - start
+        if state < Rans64.RANS64_L:
+            state = (state << 32) | (stream_words[ptr_idx] & 0xFFFFFFFF)
+            ptr_idx += 1
+        return state, ptr_idx
+
+    @staticmethod
+    def dec_get_bits(state: int, ptr_idx: int, n_bits: int, 
+                     stream_words: Sequence[int]) -> Tuple[int, int, int]:
+        val = state & ((1 << n_bits) - 1)
+        state >>= n_bits
+        if state < Rans64.RANS64_L:
+            state = (state << 32) | (stream_words[ptr_idx] & 0xFFFFFFFF)
+            ptr_idx += 1
+        return val, state, ptr_idx
+
+@dataclass
+class RansSymbol:
+    start: int
+    range: int
+    bypass: bool
+
+# (RansEncoderLibMultiThread 및 관련 클래스는 테스트에 불필요하므로 생략)
+
+# ----------------------------------------------------------------------------
+# [이전 답변] 3. RansEncoderLib
+# ----------------------------------------------------------------------------
+
+class RansEncoderLib:
+    def __init__(self):
+        self._syms: List[RansSymbol] = []
+        self._stream: bytes = b""
+
+    def reset(self):
+        self._syms.clear()
+        self._stream = b""
+
+    def get_encoded_stream(self) -> bytes:
+        return self._stream
+
+    def encode_with_indexes(
+        self,
+        symbols: List[int], indexes: List[int], cdfs: List[List[int]],
+        cdfs_sizes: List[int], offsets: List[int]
+    ):
+        for i in range(len(symbols) - 1, -1, -1):
+            cdf_idx = indexes[i]
+            if cdf_idx < 0: continue
+            
+            cdf = cdfs[cdf_idx]
+            max_value = cdfs_sizes[cdf_idx] - 2
+            value = symbols[i] - offsets[cdf_idx]
+
+            raw_val = 0
+            if value < 0:
+                raw_val = -2 * value - 1
+                value = max_value
+            elif value >= max_value:
+                raw_val = 2 * (value - max_value)
+                value = max_value
+
+            self._syms.append(RansSymbol(
+                start=cdf[value],
+                range=cdf[value + 1] - cdf[value],
+                bypass=False
+            ))
+
+            if value == max_value:
+                n_bypass = 0
+                if raw_val > 0:
+                    n_bypass = (raw_val.bit_length() + Rans64.BYPASS_PRECISION - 1) // Rans64.BYPASS_PRECISION
+
+                val = n_bypass
+                while val >= Rans64.MAX_BYPASS_VAL:
+                    self._syms.append(RansSymbol(
+                        start=Rans64.MAX_BYPASS_VAL, range=Rans64.MAX_BYPASS_VAL + 1, bypass=True
+                    ))
+                    val -= Rans64.MAX_BYPASS_VAL
+                
+                self._syms.append(RansSymbol(
+                    start=val, range=val + 1, bypass=True
+                ))
+                
+                for j in range(n_bypass):
+                    val1 = (raw_val >> (j * Rans64.BYPASS_PRECISION)) & Rans64.MAX_BYPASS_VAL
+                    self._syms.append(RansSymbol(
+                        start=val1, range=val1 + 1, bypass=True
+                    ))
+
+    def flush(self):
+        state = Rans64.enc_init()
+        output_words: List[int] = [] 
+
+        for sym in reversed(self._syms):
+            if not sym.bypass:
+                state = Rans64.enc_put(state, sym.start, sym.range, 
+                                       Rans64.PRECISION, output_words)
+            else:
+                state = Rans64.enc_put_bits(state, sym.start, 
+                                            Rans64.BYPASS_PRECISION, output_words)
+        
+        Rans64.enc_flush(state, output_words)
+        
+        buffer = bytearray()
+        for word in reversed(output_words):
+            buffer.extend(word.to_bytes(4, 'little', signed=False))
+        self._stream = bytes(buffer)
+
+# ----------------------------------------------------------------------------
+# [이전 답변] 4. RansDecoderLib
+# ----------------------------------------------------------------------------
+
+class RansDecoderLib:
+    def __init__(self):
+        self._rans_state: int = 0
+        self._ptr_idx: int = 0
+        self._stream: bytes = b""
+        self._stream_words: List[int] = []
+
+    def set_stream(self, encoded: bytes):
+        self._stream = encoded
+        self._stream_words = []
+        for i in range(0, len(encoded), 4):
+            word_bytes = encoded[i:i+4]
+            # C++ 코드는 32비트 정렬을 가정하므로 패딩된 바이트는 무시
+            if len(word_bytes) == 4:
+                self._stream_words.append(
+                    int.from_bytes(word_bytes, 'little', signed=False)
+                )
+
+        self._rans_state, self._ptr_idx = Rans64.dec_init(self._stream_words)
+
+    def decode_stream(
+        self,
+        indexes: List[int], cdfs: List[List[int]],
+        cdfs_sizes: List[int], offsets: List[int]
+    ) -> List[int]:
+        
+        index_size = len(indexes)
+        output = [0] * index_size
+
+        for i in range(index_size):
+            cdf_idx = indexes[i]
+            offset = offsets[cdf_idx]
+            
+            if cdf_idx < 0:
+                output[i] = offset
+                continue
+
+            cdf = cdfs[cdf_idx]
+            cdf_size = cdfs_sizes[cdf_idx]
+            max_value = cdf_size - 2
+            
+            cum_freq = Rans64.dec_get(self._rans_state, Rans64.PRECISION)
+            
+            cdf_view = cdf[:cdf_size] 
+            s = bisect.bisect_right(cdf_view, cum_freq) - 1
+            
+            self._rans_state, self._ptr_idx = Rans64.dec_advance(
+                self._rans_state, self._ptr_idx,
+                cdf[s], cdf[s + 1] - cdf[s], Rans64.PRECISION,
+                self._stream_words
+            )
+
+            value = s
+
+            if value == max_value:
+                val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
+                    self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
+                )
+                n_bypass = val
+                
+                while val == Rans64.MAX_BYPASS_VAL:
+                    val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
+                        self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
+                    )
+                    n_bypass += val
+
+                raw_val = 0
+                for j in range(n_bypass):
+                    val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
+                        self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
+                    )
+                    raw_val |= (val << (j * Rans64.BYPASS_PRECISION))
+                
+                if (raw_val & 1):
+                    value = -(raw_val >> 1) - 1
+                else:
+                    value = (raw_val >> 1) + max_value
+
+            output[i] = value + offset
+            
+        return output
+
+# ----------------------------------------------------------------------------
+# 5. 테스트 실행 코드
+# ----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    print("🚀 RansEncoder/Decoder 테스트 시작...")
+
+    # --- 1. 테스트 데이터 준비 ---
+    
+    # [0, 1, 2] 심볼에 대한 확률 (총 합은 1이 아니어도 됨)
+    pmf = [0.2, 0.5, 0.3] 
+    
+    # 바이패스 모드 테스트 포함:
+    # (offset = 0 기준)
+    # max_value = len(pmf) - 1 = 2
+    # [0, 1]: 정상 인코딩
+    # [2]: 정상 인코딩 (sentinel, raw_val=0, n_bypass=0)
+    # [3]: 바이패스 (value=3 >= 2 -> raw_val=2)
+    # [-1]: 바이패스 (value=-1 < 0 -> raw_val=1)
+    # [-10]: 바이패스 (value=-10 < 0 -> raw_val=19)
+    # [10]: 바이패스 (value=10 >= 2 -> raw_val=16)
+    test_symbols = [0, 1, 2, 1, 0, 3, 1, 2, -1, 0, -10, 10, 1]
+    
+    print(f"원본 심볼: {test_symbols}")
+
+    # CDF 생성
+    precision = Rans64.PRECISION
+    my_cdf = pmf_to_quantized_cdf(pmf, precision)
+
+    # 인코더/디코더 입력 생성
+    cdfs = [my_cdf]
+    cdfs_sizes = [len(my_cdf)]
+    offsets = [0] # offset 0 사용
+    
+    # 모든 심볼이 0번 CDF를 사용하도록 설정
+    indexes = [0] * len(test_symbols)
+
+    # --- 2. 인코딩 ---
+    encoder = RansEncoderLib()
+    encoder.encode_with_indexes(test_symbols, indexes, cdfs, cdfs_sizes, offsets)
+    encoder.flush()
+    
+    encoded_stream = encoder.get_encoded_stream()
+    print(f"인코딩된 스트림 크기: {len(encoded_stream)} 바이트")
+
+    # --- 3. 디코딩 ---
+    decoder = RansDecoderLib()
+    decoder.set_stream(encoded_stream)
+    
+    decoded_symbols = decoder.decode_stream(indexes, cdfs, cdfs_sizes, offsets)
+    print(f"디코딩된 심볼: {decoded_symbols}")
+
+    # --- 4. 검증 ---
+    assert test_symbols == decoded_symbols
+    
+    print("\n✅ 테스트 통과: 원본과 디코딩된 심볼이 일치합니다!")
