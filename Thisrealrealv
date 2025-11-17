@@ -1,16 +1,17 @@
-import math
 import bisect
-import enum
-import struct
-import threading
+import math
+from typing import List, Sequence, Tuple
 from dataclasses import dataclass
-from typing import List, Deque, Optional, Tuple, Sequence
 
 # ----------------------------------------------------------------------------
-# 1. pmf_to_quantized_cdf (변경 없음)
+# 1. C++ 코드와 동일한 pmf_to_quantized_cdf (입력으로 사용)
 # ----------------------------------------------------------------------------
+
 def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
-    # ... (이전과 동일) ...
+    """
+    PMF를 양자화된 CMF(Cumulative Mass Function)로 변환합니다.
+    (이 함수는 Rans 코드와 동일하며, AC 코더의 입력으로 완벽하게 호환됩니다.)
+    """
     cdf = [0] * (len(pmf) + 1)
     scale = 1 << precision
     for i, p in enumerate(pmf):
@@ -48,212 +49,325 @@ def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
     return cdf
 
 # ----------------------------------------------------------------------------
-# 2. RansSymbol (변경 없음)
-# ----------------------------------------------------------------------------
-@dataclass
-class RansSymbol:
-    start: int
-    range: int
-    bypass: bool
-
-# ----------------------------------------------------------------------------
-# 3. 바이트 헬퍼 (Encoder는 지난번 수정, Decoder가 이번 수정)
+# 2. 사용자 제공 "예전 코드" (ArithmeticEncoder/Decoder)
+# (이 코드는 수정 없이 그대로 사용됩니다)
 # ----------------------------------------------------------------------------
 
-class RansByteEncoder:
-    """(지난번 수정된 버전) 1바이트 단위 인코더 헬퍼"""
-    def __init__(self, precision):
-        self.precision = precision
-        self.scale = 1 << precision
-        self.L_BASE = (1 << 16)
-        self.TOP = (1 << 24)
-        self.state = self.L_BASE
-        self.stream = bytearray()
+class ArithmeticEncoder:
+    def __init__(self, precision_bits: int = 48):
+        if not 16 <= precision_bits <= 62:
+            raise ValueError("정밀도는 16비트에서 62비트 사이여야 합니다.")
+        self.precision_bits = precision_bits
+        self.max_val = (1 << self.precision_bits) - 1
+        self.half_val = (self.max_val >> 1) + 1
+        self.quarter1_val = (self.max_val >> 2) + 1
+        self.quarter3_val = self.quarter1_val * 3
+        self.low = 0
+        self.range = self.max_val
+        self._pending_bits = 0
+        self._output_bytes = bytearray()
+        self._bit_buffer = 0
+        self._bit_count = 0
 
-    def encode(self, start, freq):
-        x = self.state
-        x_max = (self.TOP >> self.precision) * freq # (지난번 수정된 부분)
-        while x >= x_max:
-            self.stream.append(x & 0xFF)
-            x >>= 8
-        self.state = ((x // freq) * self.scale) + (x % freq) + start
+    def _write_bit(self, bit: int):
+        self._bit_buffer = (self._bit_buffer << 1) | bit
+        self._bit_count += 1
+        if self._bit_count == 8:
+            self._output_bytes.append(self._bit_buffer)
+            self._bit_buffer = 0
+            self._bit_count = 0
+
+    def _write_pending_bits(self, bit: int):
+        self._write_bit(bit)
+        for _ in range(self._pending_bits):
+            self._write_bit(1 - bit)
+        self._pending_bits = 0
+
+    def _renormalize_encode(self):
+        while True:
+            if (self.low + self.range) <= self.half_val:
+                self._write_pending_bits(0)
+                self.low <<= 1
+                self.range <<= 1
+            elif self.low >= self.half_val:
+                self._write_pending_bits(1)
+                self.low = (self.low - self.half_val) << 1
+                self.range <<= 1
+            elif (self.low >= self.quarter1_val and
+                  (self.low + self.range) <= self.quarter3_val):
+                self._pending_bits += 1
+                self.low = (self.low - self.quarter1_val) << 1
+                self.range <<= 1
+            else:
+                break
+
+    def encode(self, cmf_table: Sequence[int], index: int):
+        total = cmf_table[-1]
+        if total == 0:
+            raise ValueError("CMF 테이블의 총합(total)은 0이 될 수 없습니다.")
+        if index < 0 or (index + 1) >= len(cmf_table):
+            raise IndexError("유효하지 않은 CMF 테이블 인덱스입니다.")
+        r_start = cmf_table[index]
+        r_end = cmf_table[index + 1]
+        r_count = r_end - r_start
+        if r_count == 0:
+            raise ValueError(f"심볼 {index}의 확률이 0입니다 (CMF: {r_start} -> {r_end}).")
+        self.range = self.range // total
+        self.low = self.low + r_start * self.range
+        self.range = r_count * self.range
+        self._renormalize_encode()
 
     def flush(self) -> bytes:
-        x = self.state
-        # 4바이트 flush (LIFO 순서로 추가)
-        self.stream.append((x >> 0) & 0xFF)
-        self.stream.append((x >> 8) & 0xFF)
-        self.stream.append((x >> 16) & 0xFF)
-        self.stream.append((x >> 24) & 0xFF)
-        # 전체를 뒤집어 FIFO 스트림 반환
-        return bytes(reversed(self.stream))
+        self._pending_bits += 1
+        if self.low < self.quarter1_val:
+            self._write_pending_bits(0)
+        else:
+            self._write_pending_bits(1)
+        if self._bit_count > 0:
+            self._bit_buffer <<= (8 - self._bit_count)
+            self._output_bytes.append(self._bit_buffer)
+        final_bitstream = bytes(self._output_bytes)
+        self.low = 0
+        self.range = self.max_val
+        self._pending_bits = 0
+        self._output_bytes = bytearray()
+        self._bit_buffer = 0
+        self._bit_count = 0
+        return final_bitstream
 
+class ArithmeticDecoder:
+    def __init__(self, precision_bits: int = 48):
+        if not 16 <= precision_bits <= 62:
+            raise ValueError("정밀도는 16비트에서 62비트 사이여야 합니다.")
+        self.precision_bits = precision_bits
+        self.max_val = (1 << self.precision_bits) - 1
+        self.half_val = (self.max_val >> 1) + 1
+        self.quarter1_val = (self.max_val >> 2) + 1
+        self.quarter3_val = self.quarter1_val * 3
+        self.low = 0
+        self.range = self.max_val
+        self.value = 0
+        self._bitstream = b""
+        self._byte_index = 0
+        self._bit_count = 0
+        self._current_byte = 0
 
-class RansByteDecoder:
-    """[수정됨] 1바이트 단위 디코더 헬퍼 (pop() -> ptr)"""
-    def __init__(self, precision, stream: bytes):
-        self.precision = precision
-        self.scale = 1 << precision
-        self.L_BASE = (1 << 16)
-        
-        # [수정] 스트림을 바이트 객체로 저장
-        self.stream: bytes = stream 
-        self.ptr: int = 0 # [수정] 포인터(인덱스) 사용
-        
-        # [수정] 스트림의 맨 앞 4바이트(FIFO)를 읽어 상태 초기화
-        # 인코더가 [B0, B1, B2, B3] (LIFO) -> [B3, B2, B1, B0] (FIFO)로 썼음
-        b0 = self.stream[3]
-        b1 = self.stream[2]
-        b2 = self.stream[1]
-        b3 = self.stream[0]
-        
-        self.state = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-        self.ptr = 4 # 데이터(Renorm)는 인덱스 4부터 시작
+    def _read_bit(self) -> int:
+        if self._bit_count == 0:
+            if self._byte_index < len(self._bitstream):
+                self._current_byte = self._bitstream[self._byte_index]
+                self._byte_index += 1
+            else:
+                self._current_byte = 0
+            self._bit_count = 8
+        bit = (self._current_byte >> 7) & 1
+        self._current_byte = (self._current_byte << 1) & 0xFF
+        self._bit_count -= 1
+        return bit
 
-    def get_symbol(self) -> int:
-        """현재 상태에서 누적 빈도를 읽습니다."""
-        return self.state & (self.scale - 1)
+    def set_bitstream(self, bitstream: bytes):
+        if not bitstream:
+            raise ValueError("비트스트림이 비어있습니다.")
+        self._bitstream = bitstream
+        self._byte_index = 0
+        self._bit_count = 0
+        self._current_byte = 0
+        self.low = 0
+        self.range = self.max_val
+        self.value = 0
+        for _ in range(self.precision_bits):
+            self.value = (self.value << 1) | self._read_bit()
 
-    def decode(self, start, freq):
-        """심볼(start, freq)을 기반으로 디코더 상태를 업데이트합니다."""
-        self.state = freq * (self.state >> self.precision) + (self.state & (self.scale - 1)) - start
-        
-        # [수정] pop() 대신 ptr로 스트림에서 읽기
-        while self.state < self.L_BASE:
-            self.state = (self.state << 8) | self.stream[self.ptr]
-            self.ptr += 1
+    def _renormalize_decode(self):
+        while True:
+            if (self.low + self.range) <= self.half_val:
+                pass
+            elif self.low >= self.half_val:
+                self.low -= self.half_val
+                self.value -= self.half_val
+            elif (self.low >= self.quarter1_val and
+                  (self.low + self.range) <= self.quarter3_val):
+                self.low -= self.quarter1_val
+                self.value -= self.quarter1_val
+            else:
+                break
+            self.low <<= 1
+            self.range <<= 1
+            self.value = (self.value << 1) | self._read_bit()
+
+    def decode(self, cmf_table: Sequence[int]) -> int:
+        total = cmf_table[-1]
+        if total == 0:
+            raise ValueError("CMF 테이블의 총합(total)은 0이 될 수 없습니다.")
+        self.range = self.range // total
+        scaled_value = (self.value - self.low) // self.range
+        index = bisect.bisect_right(cmf_table, scaled_value) - 1
+        if index < 0 or (index + 1) >= len(cmf_table):
+            raise RuntimeError(f"디코딩 오류: CMF 테이블에서 유효한 인덱스를 찾지 못했습니다. (scaled_value={scaled_value})")
+        r_start = cmf_table[index]
+        r_end = cmf_table[index + 1]
+        r_count = r_end - r_start
+        self.low = self.low + r_start * self.range
+        self.range = r_count * self.range
+        self._renormalize_decode()
+        return index
 
 # ----------------------------------------------------------------------------
-# 4. Lib 클래스 (변경 없음)
+# 3. [신규] AC코더를 Rans I/O에 맞게 래핑(Wrapping)하는 클래스
 # ----------------------------------------------------------------------------
-class RansEncoderLibByte:
-    # ... (RansEncoderLibByte 코드는 이전 답변과 동일) ...
-    def __init__(self, precision):
-        self._syms: List[RansSymbol] = []
-        self._stream: bytes = b""
-        self.encoder = RansByteEncoder(precision)
-        self.bypass_precision = 4
-        self.max_bypass_val = (1 << self.bypass_precision) - 1
-        self.precision_backup = self.encoder.precision
-        self.scale_backup = self.encoder.scale
-        self.bypass_scale = 1 << self.bypass_precision
-    def reset(self):
-        self._syms.clear()
-        self._stream = b""
-        self.encoder = RansByteEncoder(self.encoder.precision)
-    def get_encoded_stream(self) -> bytes:
-        return self._stream
+
+class ACEncoderLib:
+    """
+    RansEncoderLib와 동일한 인터페이스를 가지지만,
+    내부적으로 ArithmeticEncoder를 사용해 BPP를 최적화합니다.
+    """
+    def __init__(self, precision_bits: int = 48):
+        self.encoder = ArithmeticEncoder(precision_bits)
+        
+        # 바이패스 모드("날것 비트")를 위한 CMF 테이블
+        # 1. 50:50 확률 (비트 1개 인코딩용)
+        self.cmf_bypass_bit = [0, 1, 2]
+        # 2. 0~32비트 길이 인코딩용 (최대 32비트 정수 가정)
+        #    (간단하게 0~33까지 34개 심볼에 동일 확률 부여)
+        self.cmf_num_bits = list(range(34))
+
+    def _encode_raw_bits(self, value: int, num_bits: int):
+        """
+        값을 num_bits 만큼의 '날것 비트'로 인코딩합니다.
+        (MSB - 최상위 비트부터)
+        """
+        for i in range(num_bits - 1, -1, -1):
+            bit = (value >> i) & 1
+            self.encoder.encode(self.cmf_bypass_bit, bit)
+
     def encode_with_indexes(
         self,
         symbols: List[int], indexes: List[int], cdfs: List[List[int]],
         cdfs_sizes: List[int], offsets: List[int]
     ):
+        """
+        Rans 코드의 인코딩 로직을 AC 코더로 동일하게 수행합니다.
+        """
         for i in range(len(symbols)):
             cdf_idx = indexes[i]
-            if cdf_idx < 0: continue
+            if cdf_idx < 0:
+                continue
+            
             cdf = cdfs[cdf_idx]
             max_value = cdfs_sizes[cdf_idx] - 2
             value = symbols[i] - offsets[cdf_idx]
-            raw_val = 0
+
             if value < 0:
-                raw_val = -2 * value - 1
-                value = max_value
+                # --- Underflow Bypass ---
+                # 1. AC로 Sentinel (max_value) 인코딩
+                self.encoder.encode(cdf, max_value)
+                
+                # 2. raw_val 계산 (Rans와 동일)
+                raw_val = -2 * value - 1 # (항상 홀수)
+                num_bits = raw_val.bit_length()
+                
+                # 3. raw_val의 비트 길이(num_bits)를 AC로 인코딩
+                self.encoder.encode(self.cmf_num_bits, num_bits)
+                
+                # 4. raw_val 값을 '날것 비트'로 인코딩
+                self._encode_raw_bits(raw_val, num_bits)
+                
             elif value >= max_value:
-                raw_val = 2 * (value - max_value)
-                value = max_value
-            self._syms.append(RansSymbol(
-                start=cdf[value], range=cdf[value + 1] - cdf[value], bypass=False
-            ))
-            if value == max_value:
-                n_bypass = 0
-                if raw_val > 0:
-                    n_bypass = (raw_val.bit_length() + self.bypass_precision - 1) // self.bypass_precision
-                val = n_bypass
-                while val >= self.max_bypass_val:
-                    self._syms.append(RansSymbol(
-                        start=self.max_bypass_val, range=0, bypass=True
-                    ))
-                    val -= self.max_bypass_val
-                self._syms.append(RansSymbol(start=val, range=0, bypass=True))
-                for j in range(n_bypass):
-                    val1 = (raw_val >> (j * self.bypass_precision)) & self.max_bypass_val
-                    self._syms.append(RansSymbol(start=val1, range=0, bypass=True))
-    def flush(self):
-        bypass_precision = self.bypass_precision
-        bypass_scale = self.bypass_scale
-        for sym in reversed(self._syms):
-            if not sym.bypass:
-                self.encoder.precision = self.precision_backup
-                self.encoder.scale = self.scale_backup
-                self.encoder.encode(sym.start, sym.range)
+                # --- Overflow Bypass (or Sentinel) ---
+                # 1. AC로 Sentinel (max_value) 인코딩
+                self.encoder.encode(cdf, max_value)
+                
+                # 2. raw_val 계산 (Rans와 동일)
+                raw_val = 2 * (value - max_value) # (항상 짝수, 0 포함)
+                num_bits = raw_val.bit_length()
+                if raw_val == 0:
+                    num_bits = 1 # 0도 1비트로 인코딩
+                
+                # 3. raw_val의 비트 길이(num_bits)를 AC로 인코딩
+                self.encoder.encode(self.cmf_num_bits, num_bits)
+                
+                # 4. raw_val 값을 '날것 비트'로 인코딩
+                self._encode_raw_bits(raw_val, num_bits)
+
             else:
-                self.encoder.precision = bypass_precision
-                self.encoder.scale = bypass_scale
-                self.encoder.encode(sym.start, 1) # (start=val, freq=1)
-        self.encoder.precision = self.precision_backup
-        self.encoder.scale = self.scale_backup
-        self._stream = self.encoder.flush()
+                # --- Normal AC Encoding ---
+                self.encoder.encode(cdf, value)
+
+    def flush(self) -> bytes:
+        return self.encoder.flush()
 
 
-class RansDecoderLibByte:
-    # ... (RansDecoderLibByte 코드는 이전 답변과 동일, RansByteDecoder를 호출) ...
-    def __init__(self, precision):
-        self.precision = precision
-        self.decoder = None
-        self.bypass_precision = 4
-        self.max_bypass_val = (1 << self.bypass_precision) - 1
-        self.precision_backup = self.precision
-        self.scale_backup = 1 << self.precision
-        self.bypass_scale = 1 << self.bypass_precision
+class ACDecoderLib:
+    """
+    RansDecoderLib와 동일한 인터페이스를 가지는 AC 디코더 래퍼
+    """
+    def __init__(self, precision_bits: int = 48):
+        self.decoder = ArithmeticDecoder(precision_bits)
+        # 인코더와 CMF 테이블이 정확히 일치해야 함
+        self.cmf_bypass_bit = [0, 1, 2]
+        self.cmf_num_bits = list(range(34))
+
+    def _decode_raw_bits(self, num_bits: int) -> int:
+        """num_bits 만큼의 '날것 비트'를 디코딩하여 값으로 복원합니다."""
+        value = 0
+        for _ in range(num_bits):
+            bit = self.decoder.decode(self.cmf_bypass_bit)
+            value = (value << 1) | bit
+        return value
+
     def set_stream(self, encoded: bytes):
-        # [수정] 버그가 수정된 RansByteDecoder를 생성
-        self.decoder = RansByteDecoder(self.precision, encoded)
+        self.decoder.set_bitstream(encoded)
+
     def decode_stream(
         self,
         indexes: List[int], cdfs: List[List[int]],
         cdfs_sizes: List[int], offsets: List[int]
     ) -> List[int]:
+        
         index_size = len(indexes)
         output = [0] * index_size
-        bypass_precision = self.bypass_precision
-        bypass_scale = self.bypass_scale
+
         for i in range(index_size):
             cdf_idx = indexes[i]
             offset = offsets[cdf_idx]
+            
             if cdf_idx < 0:
                 output[i] = offset
                 continue
+
             cdf = cdfs[cdf_idx]
             cdf_size = cdfs_sizes[cdf_idx]
             max_value = cdf_size - 2
-            self.decoder.precision = self.precision_backup
-            self.decoder.scale = self.scale_backup
-            cum_freq = self.decoder.get_symbol()
-            cdf_view = cdf[:cdf_size] 
-            s = bisect.bisect_right(cdf_view, cum_freq) - 1
-            self.decoder.decode(cdf[s], cdf[s + 1] - cdf[s])
+            
+            # 1. AC로 심볼 디코딩
+            s = self.decoder.decode(cdf)
             value = s
+
             if value == max_value:
-                self.decoder.precision = bypass_precision
-                self.decoder.scale = bypass_scale
-                val = self.decoder.get_symbol()
-                self.decoder.decode(val, 1)
-                n_bypass = val
-                while val == self.max_bypass_val:
-                    val = self.decoder.get_symbol()
-                    self.decoder.decode(val, 1)
-                    n_bypass += val
-                raw_val = 0
-                for j in range(n_bypass):
-                    val = self.decoder.get_symbol()
-                    self.decoder.decode(val, 1)
-                    raw_val |= (val << (j * self.bypass_precision))
-                if (raw_val & 1):
+                # --- Bypass 모드 ---
+                # 1. raw_val의 비트 길이 디코딩
+                num_bits = self.decoder.decode(self.cmf_num_bits)
+                
+                # 2. raw_val 값 디코딩
+                raw_val = self._decode_raw_bits(num_bits)
+
+                # 3. Rans와 동일한 로직으로 값 복원
+                if raw_val == 0:
+                    value = max_value # (Sentinel)
+                elif (raw_val & 1): # 홀수 (Underflow)
                     value = -(raw_val >> 1) - 1
-                else:
+                else: # 짝수 (Overflow)
                     value = (raw_val >> 1) + max_value
+
             output[i] = value + offset
+            
         return output
+
+
+
+
+
+
 
 # ----------------------------------------------------------------------------
 # 5. 테스트 코드 (변경 없음)
@@ -272,10 +386,9 @@ if __name__ == "__main__":
         cdfs_sizes = [len(my_cdf)]
 
         # --- 인코딩 ---
-        encoder = RansEncoderLibByte(precision=precision) 
+        encoder = ACEncoderLib(32) 
         encoder.encode_with_indexes(test_symbols, indexes, cdfs, cdfs_sizes, offsets)
-        encoder.flush()
-        encoded_stream = encoder.get_encoded_stream()
+        encoded_stream = encoder.flush()
         
         stream_len = len(encoded_stream)
         bpp = (stream_len * 8 / len(test_symbols)) if test_symbols else 0
@@ -284,7 +397,7 @@ if __name__ == "__main__":
         print(f"BPP (per symbol): {bpp:.4f}")
 
         # --- 디코딩 ---
-        decoder = RansDecoderLibByte(precision=precision)
+        decoder = ACDecoderLib(32)
         decoder.set_stream(encoded_stream)
         decoded_symbols = decoder.decode_stream(indexes, cdfs, cdfs_sizes, offsets)
         print(f"디코딩된 심볼: {decoded_symbols}")
