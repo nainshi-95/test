@@ -7,66 +7,11 @@ import threading
 from dataclasses import dataclass
 from typing import List, Deque, Optional, Tuple, Sequence
 
-# ----------------------------------------------------------------------------
-# 1. pmf_to_quantized_cdf 함수
-# ----------------------------------------------------------------------------
-
-def pmf_to_quantized_cdf(pmf: List[float], precision: int) -> List[int]:
-    """
-    PMF(확률 질량 함수)를 양자화된 CDF(누적 분포 함수)로 변환합니다.
-    """
-    cdf = [0] * (len(pmf) + 1)
-    scale = 1 << precision
-
-    for i, p in enumerate(pmf):
-        scaled_p = p * scale
-        cdf[i + 1] = int(math.floor(scaled_p + 0.5))
-
-    total = sum(cdf)
-    if total == 0:
-        total = 1
-
-    for i in range(len(cdf)):
-        cdf[i] = (scale * cdf[i]) // total
-
-    current_sum = 0
-    for i in range(len(cdf)):
-        current_sum += cdf[i]
-        cdf[i] = current_sum
-
-    cdf[-1] = scale
-
-    n = len(cdf) - 1
-    for i in range(n):
-        if cdf[i] == cdf[i + 1]:
-            best_freq = (1 << 32) - 1
-            best_steal = -1
-            
-            for j in range(n):
-                freq = cdf[j + 1] - cdf[j]
-                if freq > 1 and freq < best_freq:
-                    best_freq = freq
-                    best_steal = j
-
-            assert best_steal != -1, "Cannot find a symbol to steal frequency from"
-
-            if best_steal < i:
-                for j in range(best_steal + 1, i + 1):
-                    cdf[j] -= 1
-            else:
-                assert best_steal > i, "best_steal == i, which should not happen"
-                for j in range(i + 1, best_steal + 1):
-                    cdf[j] += 1
-
-    assert cdf[0] == 0
-    assert cdf[-1] == scale
-    for i in range(n):
-        assert cdf[i + 1] > cdf[i], f"CDF not strictly increasing at index {i}"
-
-    return cdf
+# ... (pmf_to_quantized_cdf 함수는 동일) ...
+# (RansSymbol 자료구조는 동일) ...
 
 # ----------------------------------------------------------------------------
-# 2. Rans64 헬퍼 및 자료구조
+# Rans64 헬퍼 클래스 (enc_flush 수정)
 # ----------------------------------------------------------------------------
 
 class Rans64:
@@ -80,9 +25,13 @@ class Rans64:
         return Rans64.RANS64_L
 
     @staticmethod
-    def enc_flush(state: int, output_words: List[int]):
-        output_words.append(state & 0xFFFFFFFF)
-        output_words.append((state >> 32) & 0xFFFFFFFF)
+    def enc_flush(state: int) -> Tuple[int, int]:
+        """
+        [수정됨] Rans64EncFlush:
+        최종 상태를 (Low 32, High 32) 튜플로 반환합니다.
+        (리스트에 직접 추가하지 않음)
+        """
+        return (state & 0xFFFFFFFF), ((state >> 32) & 0xFFFFFFFF)
 
     @staticmethod
     def enc_put(state: int, start: int, freq: int, precision: int, 
@@ -90,6 +39,7 @@ class Rans64:
         scale = 1 << precision
         x_max = ((Rans64.RANS64_L >> precision) << 32) * freq
         if state >= x_max:
+            # renorm word를 LIFO 순서로 추가
             output_words.append(state & 0xFFFFFFFF)
             state >>= 32
         return (state // freq) * scale + (state % freq) + start
@@ -99,10 +49,12 @@ class Rans64:
                      output_words: List[int]) -> int:
         x_max = 1 << (64 - n_bits)
         if state >= x_max:
+            # renorm word를 LIFO 순서로 추가
             output_words.append(state & 0xFFFFFFFF)
             state >>= 32
         return (state << n_bits) | val
 
+    # ... (dec_init, dec_get, dec_advance, dec_get_bits 함수는 동일) ...
     @staticmethod
     def dec_init(stream_words: Sequence[int]) -> Tuple[int, int]:
         state = (stream_words[0] & 0xFFFFFFFF) | \
@@ -122,6 +74,7 @@ class Rans64:
         scale = 1 << precision
         state = freq * (state >> precision) + (state & (scale - 1)) - start
         if state < Rans64.RANS64_L:
+            # [오류 발생 지점] ptr_idx가 stream_words 길이를 넘어가면 안 됨
             state = (state << 32) | (stream_words[ptr_idx] & 0xFFFFFFFF)
             ptr_idx += 1
         return state, ptr_idx
@@ -132,18 +85,13 @@ class Rans64:
         val = state & ((1 << n_bits) - 1)
         state >>= n_bits
         if state < Rans64.RANS64_L:
-            state = (state << 32) | (stream_words[ptr_idx] & 0xFFFFFFFF)
+            # [오류 발생 지점] ptr_idx가 stream_words 길이를 넘어가면 안 됨
+            state = (state << 32) | (stream_words[ptr_idx] & 0xFFFFFFFF) 
             ptr_idx += 1
         return val, state, ptr_idx
 
-@dataclass
-class RansSymbol:
-    start: int
-    range: int
-    bypass: bool
-
 # ----------------------------------------------------------------------------
-# 3. RansEncoderLib (수정됨)
+# RansEncoderLib (flush 수정)
 # ----------------------------------------------------------------------------
 
 class RansEncoderLib:
@@ -151,6 +99,7 @@ class RansEncoderLib:
         self._syms: List[RansSymbol] = []
         self._stream: bytes = b""
 
+    # ... (reset, get_encoded_stream, encode_with_indexes 함수는 동일) ...
     def reset(self):
         self._syms.clear()
         self._stream = b""
@@ -163,16 +112,12 @@ class RansEncoderLib:
         symbols: List[int], indexes: List[int], cdfs: List[List[int]],
         cdfs_sizes: List[int], offsets: List[int]
     ):
-        # [수정됨] C++ 원본 코드는 주석(backward)과 달리 '정방향' 루프입니다.
-        for i in range(len(symbols)): # <- 수정된 부분 (정방향 루프)
-            
+        for i in range(len(symbols)):
             cdf_idx = indexes[i]
             if cdf_idx < 0: continue
-            
             cdf = cdfs[cdf_idx]
             max_value = cdfs_sizes[cdf_idx] - 2
             value = symbols[i] - offsets[cdf_idx]
-
             raw_val = 0
             if value < 0:
                 raw_val = -2 * value - 1
@@ -180,29 +125,22 @@ class RansEncoderLib:
             elif value >= max_value:
                 raw_val = 2 * (value - max_value)
                 value = max_value
-
             self._syms.append(RansSymbol(
-                start=cdf[value],
-                range=cdf[value + 1] - cdf[value],
-                bypass=False
+                start=cdf[value], range=cdf[value + 1] - cdf[value], bypass=False
             ))
-
             if value == max_value:
                 n_bypass = 0
                 if raw_val > 0:
                     n_bypass = (raw_val.bit_length() + Rans64.BYPASS_PRECISION - 1) // Rans64.BYPASS_PRECISION
-
                 val = n_bypass
                 while val >= Rans64.MAX_BYPASS_VAL:
                     self._syms.append(RansSymbol(
                         start=Rans64.MAX_BYPASS_VAL, range=Rans64.MAX_BYPASS_VAL + 1, bypass=True
                     ))
                     val -= Rans64.MAX_BYPASS_VAL
-                
                 self._syms.append(RansSymbol(
                     start=val, range=val + 1, bypass=True
                 ))
-                
                 for j in range(n_bypass):
                     val1 = (raw_val >> (j * Rans64.BYPASS_PRECISION)) & Rans64.MAX_BYPASS_VAL
                     self._syms.append(RansSymbol(
@@ -210,29 +148,41 @@ class RansEncoderLib:
                     ))
 
     def flush(self):
+        """
+        [수정됨] flush 로직을 C++ 순서와 동일하게 변경합니다.
+        """
         state = Rans64.enc_init()
-        output_words: List[int] = [] 
+        # 1. Renorm 워드만 LIFO 순서로 수집
+        renorm_words: List[int] = [] 
 
         for sym in reversed(self._syms):
             if not sym.bypass:
                 state = Rans64.enc_put(state, sym.start, sym.range, 
-                                       Rans64.PRECISION, output_words)
+                                       Rans64.PRECISION, renorm_words)
             else:
                 state = Rans64.enc_put_bits(state, sym.start, 
-                                            Rans64.BYPASS_PRECISION, output_words)
+                                            Rans64.BYPASS_PRECISION, renorm_words)
         
-        Rans64.enc_flush(state, output_words)
+        # 2. 최종 Flush 워드 (Low, High)를 받음
+        low_word, high_word = Rans64.enc_flush(state)
+
+        # 3. 최종 스트림 (FIFO) 구성: [Low, High, Renorm_0, Renorm_1, ...]
+        final_stream_words = [low_word, high_word]
         
+        # 4. LIFO로 수집된 renorm_words를 뒤집어서 (FIFO) 추가
+        final_stream_words.extend(reversed(renorm_words))
+
+        # 5. 바이트로 변환 (이제 전체를 뒤집지 않음)
         buffer = bytearray()
-        for word in reversed(output_words):
+        for word in final_stream_words:
             buffer.extend(word.to_bytes(4, 'little', signed=False))
         self._stream = bytes(buffer)
 
 # ----------------------------------------------------------------------------
-# 4. RansDecoderLib
+# RansDecoderLib (이전과 동일)
 # ----------------------------------------------------------------------------
-
 class RansDecoderLib:
+    # ... (RansDecoderLib의 코드는 수정할 필요 없음) ...
     def __init__(self):
         self._rans_state: int = 0
         self._ptr_idx: int = 0
@@ -242,6 +192,7 @@ class RansDecoderLib:
     def set_stream(self, encoded: bytes):
         self._stream = encoded
         self._stream_words = []
+        # C++ 인코더는 항상 4바이트 배수 길이를 보장합니다.
         for i in range(0, len(encoded), 4):
             word_bytes = encoded[i:i+4]
             if len(word_bytes) == 4:
@@ -259,104 +210,101 @@ class RansDecoderLib:
         
         index_size = len(indexes)
         output = [0] * index_size
-
         for i in range(index_size):
             cdf_idx = indexes[i]
             offset = offsets[cdf_idx]
-            
             if cdf_idx < 0:
                 output[i] = offset
                 continue
-
             cdf = cdfs[cdf_idx]
             cdf_size = cdfs_sizes[cdf_idx]
             max_value = cdf_size - 2
-            
             cum_freq = Rans64.dec_get(self._rans_state, Rans64.PRECISION)
-            
             cdf_view = cdf[:cdf_size] 
             s = bisect.bisect_right(cdf_view, cum_freq) - 1
-            
             self._rans_state, self._ptr_idx = Rans64.dec_advance(
                 self._rans_state, self._ptr_idx,
                 cdf[s], cdf[s + 1] - cdf[s], Rans64.PRECISION,
                 self._stream_words
             )
-
             value = s
-
             if value == max_value:
                 val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
                     self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
                 )
                 n_bypass = val
-                
                 while val == Rans64.MAX_BYPASS_VAL:
                     val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
                         self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
                     )
                     n_bypass += val
-
                 raw_val = 0
                 for j in range(n_bypass):
                     val, self._rans_state, self._ptr_idx = Rans64.dec_get_bits(
                         self._rans_state, self._ptr_idx, Rans64.BYPASS_PRECISION, self._stream_words
                     )
                     raw_val |= (val << (j * Rans64.BYPASS_PRECISION))
-                
                 if (raw_val & 1):
                     value = -(raw_val >> 1) - 1
                 else:
                     value = (raw_val >> 1) + max_value
-
             output[i] = value + offset
-            
         return output
 
 # ----------------------------------------------------------------------------
-# 5. 테스트 실행 코드
+# 테스트 실행 코드 (단일 심볼 테스트 추가)
 # ----------------------------------------------------------------------------
 
+# (pmf_to_quantized_cdf 함수는 이 파일 상단에 있어야 함)
+# (RansSymbol, Rans64, RansEncoderLib, RansDecoderLib가 모두 정의되어 있어야 함)
+
 if __name__ == "__main__":
-    print("🚀 RansEncoder/Decoder 테스트 시작...")
+    
+    def run_test(test_name, test_symbols, pmf, offsets, indexes):
+        print(f"\n--- {test_name} ---")
+        print(f"원본 심볼: {test_symbols}")
 
-    # --- 1. 테스트 데이터 준비 ---
-    
-    pmf = [0.2, 0.5, 0.3] 
-    
-    # 바이패스 모드 테스트 포함: [0, 1, 2, 3(Bypass), -1(Bypass), -10(Bypass), 10(Bypass)]
-    test_symbols = [0, 1, 2, 1, 0, 3, 1, 2, -1, 0, -10, 10, 1]
-    
-    print(f"원본 심볼: {test_symbols}")
+        precision = Rans64.PRECISION
+        my_cdf = pmf_to_quantized_cdf(pmf, precision)
+        
+        cdfs = [my_cdf]
+        cdfs_sizes = [len(my_cdf)]
 
-    # CDF 생성
-    precision = Rans64.PRECISION
-    my_cdf = pmf_to_quantized_cdf(pmf, precision)
+        # --- 인코딩 ---
+        encoder = RansEncoderLib()
+        encoder.encode_with_indexes(test_symbols, indexes, cdfs, cdfs_sizes, offsets)
+        encoder.flush()
+        encoded_stream = encoder.get_encoded_stream()
+        print(f"스트림 크기: {len(encoded_stream)} 바이트")
 
-    # 인코더/디코더 입력 생성
-    cdfs = [my_cdf]
-    cdfs_sizes = [len(my_cdf)]
-    offsets = [0] # offset 0 사용
-    
-    # 모든 심볼이 0번 CDF를 사용하도록 설정
-    indexes = [0] * len(test_symbols)
+        # --- 디코딩 ---
+        decoder = RansDecoderLib()
+        decoder.set_stream(encoded_stream)
+        decoded_symbols = decoder.decode_stream(indexes, cdfs, cdfs_sizes, offsets)
+        print(f"디코딩된 심볼: {decoded_symbols}")
 
-    # --- 2. 인코딩 ---
-    encoder = RansEncoderLib()
-    encoder.encode_with_indexes(test_symbols, indexes, cdfs, cdfs_sizes, offsets)
-    encoder.flush()
-    
-    encoded_stream = encoder.get_encoded_stream()
-    print(f"인코딩된 스트림 크기: {len(encoded_stream)} 바이트")
+        # --- 검증 ---
+        assert test_symbols == decoded_symbols
+        print(f"✅ {test_name} 통과!")
 
-    # --- 3. 디코딩 ---
-    decoder = RansDecoderLib()
-    decoder.set_stream(encoded_stream)
-    
-    decoded_symbols = decoder.decode_stream(indexes, cdfs, cdfs_sizes, offsets)
-    print(f"디코딩된 심볼: {decoded_symbols}")
 
-    # --- 4. 검증 ---
-    assert test_symbols == decoded_symbols
+    # --- 테스트 1: (이전 테스트 케이스) ---
+    pmf_1 = [0.2, 0.5, 0.3] 
+    symbols_1 = [0, 1, 2, 1, 0, 3, 1, 2, -1, 0, -10, 10, 1]
+    offsets_1 = [0]
+    indexes_1 = [0] * len(symbols_1)
+    run_test("다중 심볼 및 바이패스 테스트", symbols_1, pmf_1, offsets_1, indexes_1)
     
-    print("\n✅ 테스트 통과: 원본과 디코딩된 심볼이 일치합니다!")
+    # --- 테스트 2: (오류를 유발했던 단일 심볼 테스트) ---
+    pmf_2 = [0.8, 0.2]
+    symbols_2 = [0]
+    offsets_2 = [0]
+    indexes_2 = [0] * len(symbols_2)
+    run_test("단일 심볼 테스트", symbols_2, pmf_2, offsets_2, indexes_2)
+
+    # --- 테스트 3: (Offset 테스트) ---
+    pmf_3 = [0.1, 0.9] # 0, 1
+    symbols_3 = [100, 101, 100, 100] # offset 100 기준 0, 1, 0, 0
+    offsets_3 = [100]
+    indexes_3 = [0] * len(symbols_3)
+    run_test("Offset 테스트", symbols_3, pmf_3, offsets_3, indexes_3)
