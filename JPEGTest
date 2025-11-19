@@ -5,6 +5,80 @@ from skimage.metrics import peak_signal_noise_ratio
 import tempfile
 import shutil
 
+
+
+
+
+
+
+
+def get_jpeg_ecs_metrics(filepath):
+    """
+    JPEG 파일의 ECS(Entropy-Coded Segment)에 대해
+    1. 물리적 크기 (Stuffing 포함)
+    2. 논리적 크기 (Stuffing 제외, 순수 정보량)
+    를 모두 반환합니다.
+    """
+    SOS_MARKER = b'\xFF\xDA'
+    EOI_MARKER = b'\xFF\xD9'
+
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+
+        # 1. EOI 찾기 (파일 끝)
+        eoi_pos = data.rfind(EOI_MARKER)
+        if eoi_pos == -1:
+            return None
+
+        # 2. SOS 찾기 (EOI 앞쪽에서 검색)
+        sos_pos = data.rfind(SOS_MARKER, 0, eoi_pos)
+        if sos_pos == -1:
+            return None
+
+        # 3. 헤더 길이 파싱 및 데이터 시작점 계산 (작성하신 로직과 동일)
+        # SOS 마커(2bytes) + 헤더길이(2bytes값)
+        scan_header_len = int.from_bytes(data[sos_pos+2 : sos_pos+4], 'big')
+        
+        # 실제 압축 데이터 시작 위치
+        ecs_start = sos_pos + 2 + scan_header_len
+        
+        # 4. 데이터 추출
+        ecs_data = data[ecs_start : eoi_pos]
+        
+        # 5. 크기 측정
+        physical_size = len(ecs_data)  # 디스크에 기록된 실제 바이트 수
+        
+        # Byte Stuffing (FF 00) 횟수 세기
+        stuffing_count = ecs_data.count(b'\xFF\x00')
+        
+        # 논리적 크기 (순수 데이터 양)
+        logical_size = physical_size - stuffing_count
+
+        return {
+            "physical_size": physical_size, # 파일 용량 비교시 사용 (작성하신 코드의 결과와 동일)
+            "logical_size": logical_size,   # 0xFF 이스케이프를 안 쓰는 모델과 비교시 사용
+            "stuffing_count": stuffing_count
+        }
+
+    except Exception as e:
+        print(f"처리 중 오류: {e}")
+        return None
+
+# --- 사용법 ---
+# result = get_jpeg_ecs_metrics("test_block.jpg")
+# print(f"파일 점유 크기: {result['physical_size']}") 
+# print(f"순수 정보 크기: {result['logical_size']}")
+
+
+
+
+
+
+
+
+
+
 # 이전 답변에서 제공된 get_jpeg_ecs_size 함수를 여기에 포함합니다.
 def get_jpeg_ecs_size(filepath):
     """
