@@ -7,6 +7,72 @@ import shutil
 
 
 
+def get_jpeg_ecs_metrics(filepath):
+    """
+    JPEG 파일의 ECS(Entropy-Coded Segment)에 대해
+    1. 물리적 크기 (전체 바이트)
+    2. 논리적 크기 (Stuffing 및 Restart Marker 제거, 순수 허프만 비트스트림 + 패딩비트)
+    를 반환합니다.
+    """
+    SOS_MARKER = b'\xFF\xDA'
+    EOI_MARKER = b'\xFF\xD9'
+
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read()
+
+        # 1. EOI 찾기
+        eoi_pos = data.rfind(EOI_MARKER)
+        if eoi_pos == -1:
+            return None
+
+        # 2. SOS 찾기
+        sos_pos = data.rfind(SOS_MARKER, 0, eoi_pos)
+        if sos_pos == -1:
+            return None
+
+        # 3. 헤더 파싱 및 데이터 시작점 계산
+        scan_header_len = int.from_bytes(data[sos_pos+2 : sos_pos+4], 'big')
+        ecs_start = sos_pos + 2 + scan_header_len
+        
+        # 4. 데이터 추출 (SOS 헤더 직후 ~ EOI 직전)
+        ecs_data = data[ecs_start : eoi_pos]
+        
+        # 5. 크기 측정
+        physical_size = len(ecs_data)
+        
+        # (1) Byte Stuffing (FF 00) 제거
+        # FF 00은 원래 FF 데이터 1바이트를 표현하기 위해 1바이트가 추가된 것
+        stuffing_count = ecs_data.count(b'\xFF\x00')
+        
+        # (2) Restart Marker (FF D0 ~ FF D7) 제거
+        # RST 마커는 순수 오버헤드이므로 2바이트 전체를 제거해야 함
+        rst_count = 0
+        for i in range(8):
+            # 0xFFD0 ~ 0xFFD7 생성
+            rst_marker = bytes([0xFF, 0xD0 + i]) 
+            rst_count += ecs_data.count(rst_marker)
+            
+        rst_overhead = rst_count * 2  # 마커 하나당 2바이트
+        
+        # 논리적 크기 계산
+        # 전체 - (스터핑으로 늘어난 00) - (리스타트 마커 전체)
+        logical_size = physical_size - stuffing_count - rst_overhead
+
+        return {
+            "physical_size": physical_size, # 디스크상 실제 크기
+            "logical_size": logical_size,   # 순수 비트스트림 크기 (패딩비트 포함)
+            "stuffing_count": stuffing_count,
+            "rst_count": rst_count,
+            "rst_overhead": rst_overhead
+        }
+
+    except Exception as e:
+        print(f"처리 중 오류: {e}")
+        return None
+
+
+
 
 
 
